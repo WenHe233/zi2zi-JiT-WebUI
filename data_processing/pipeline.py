@@ -53,6 +53,21 @@ def _build_index_map(charset: Optional[str]) -> Dict[int, int]:
     return {cp: idx for idx, cp in enumerate(codepoints)}
 
 
+def _filter_common_codepoints(
+    common_codepoints: set[int],
+    charset: Optional[str],
+) -> tuple[set[int], Dict[int, int]]:
+    if not charset or charset.lower() in {"auto", "all-cjk"}:
+        return common_codepoints, {}
+    if charset.lower() not in SUPPORTED_CHARSETS:
+        raise ValueError(
+            f"Unsupported charset '{charset}'. Supported: "
+            f"{', '.join(sorted(SUPPORTED_CHARSETS))}"
+        )
+    charset_codepoints = get_charset_codepoints(charset)
+    return common_codepoints & charset_codepoints, _build_index_map(charset)
+
+
 def _save_json(path: Path, payload: dict) -> None:
     with open(path, "w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=False, indent=2)
@@ -140,7 +155,7 @@ def extract_train_src_target_refs(
     target_font_path: Path,
     output_dir: Path,
     sample_count: int = 500,
-    charset: str = "gb2312",
+    charset: str = "auto",
     resolution: int = DEFAULT_IMAGE_RESOLUTION,
     jpg_quality: int = DEFAULT_JPEG_QUALITY,
     seed: Optional[int] = None,
@@ -153,15 +168,9 @@ def extract_train_src_target_refs(
     target_codepoints = get_cjk_codepoints(target_font)
     common_codepoints = source_codepoints & target_codepoints
 
-    if charset:
-        if charset.lower() not in SUPPORTED_CHARSETS:
-            raise ValueError(f"Unsupported charset '{charset}'. Supported: {', '.join(sorted(SUPPORTED_CHARSETS))}")
-        charset_codepoints = get_charset_codepoints(charset)
-        filtered_codepoints = common_codepoints & charset_codepoints
-        index_map = _build_index_map(charset)
-    else:
-        filtered_codepoints = common_codepoints
-        index_map = {}
+    filtered_codepoints, index_map = _filter_common_codepoints(
+        common_codepoints, charset
+    )
 
     if len(filtered_codepoints) < 9:
         return {
@@ -262,7 +271,7 @@ def extract_test_src_target_refs(
     output_dir: Path,
     train_codepoints: List[int],
     test_sample_count: int = 8,
-    charset: str = "gb2312",
+    charset: str = "auto",
     resolution: int = DEFAULT_IMAGE_RESOLUTION,
     jpg_quality: int = DEFAULT_JPEG_QUALITY,
     seed: Optional[int] = None,
@@ -275,15 +284,9 @@ def extract_test_src_target_refs(
     target_codepoints = get_cjk_codepoints(target_font)
     common_codepoints = source_codepoints & target_codepoints
 
-    if charset:
-        if charset.lower() not in SUPPORTED_CHARSETS:
-            raise ValueError(f"Unsupported charset '{charset}'. Supported: {', '.join(sorted(SUPPORTED_CHARSETS))}")
-        charset_codepoints = get_charset_codepoints(charset)
-        filtered_codepoints = common_codepoints & charset_codepoints
-        index_map = _build_index_map(charset)
-    else:
-        filtered_codepoints = common_codepoints
-        index_map = {}
+    filtered_codepoints, index_map = _filter_common_codepoints(
+        common_codepoints, charset
+    )
 
     train_set = set(train_codepoints)
     unseen_codepoints = sorted(filtered_codepoints - train_set)
@@ -406,7 +409,7 @@ def generate_train_dataset(
     output_dir: Path,
     num_fonts: Optional[int] = None,
     chars_per_font: int = 500,
-    charset: str = "gb2312",
+    charset: str = "auto",
     resolution: int = DEFAULT_IMAGE_RESOLUTION,
     seed: int = 42,
     start_index: int = 1,
@@ -490,7 +493,7 @@ def generate_test_dataset(
     train_dir: Path,
     output_dir: Path,
     chars_per_font: int = 8,
-    charset: str = "gb2312",
+    charset: str = "auto",
     resolution: int = DEFAULT_IMAGE_RESOLUTION,
     seed: int = 99999,
     num_workers: int = 1,

@@ -20,6 +20,75 @@ OFFICIAL_MODELS = {
     "JiT-B/16": "zi2zi-JiT-B-16.pth",
     "JiT-L/16": "zi2zi-JiT-L-16.pth",
 }
+DATASET_SIZE_PRESETS = {
+    "quick": (500, 8),
+    "balanced": (3000, 64),
+    "coverage": (6000, 128),
+}
+
+
+def dataset_size_preset(name: str) -> tuple[int, int]:
+    try:
+        return DATASET_SIZE_PRESETS[name]
+    except KeyError as exc:
+        raise ValueError(f"Unknown dataset size preset: {name}") from exc
+
+
+def font_dataset_capacity(manifest: ProjectManifest, charset: str) -> int:
+    if manifest.input_mode != "font":
+        return len(manifest.target_assets)
+    source_fonts = manifest.source_fonts_for_region(
+        {
+            "gb2312": "SC",
+            "gbk": "SC",
+            "big5": "TC",
+            "jisx0208": "JP",
+            "ksx1001": "KR",
+        }.get(charset)
+    )
+    if not source_fonts or not manifest.target_assets:
+        raise ValueError("At least one source font and one target font are required")
+
+    from data_processing.charsets import get_charset_codepoints
+    from data_processing.font_utils import (
+        GlyphRendererPool,
+        has_valid_outline,
+        is_cjk_codepoint,
+        load_font,
+    )
+
+    allowed = (
+        None
+        if charset.lower() in {"auto", "all-cjk"}
+        else get_charset_codepoints(charset)
+    )
+    target_font, _ = load_font(manifest.target_assets[0])
+    target_cmap = target_font.getBestCmap() or {}
+    target_candidates = {
+        codepoint
+        for codepoint in target_cmap
+        if (allowed is None or codepoint in allowed) and is_cjk_codepoint(codepoint)
+    }
+    target_valid = {
+        codepoint
+        for codepoint in target_candidates
+        if has_valid_outline(target_font, codepoint)
+    }
+    source_pool = GlyphRendererPool(source_fonts, 256)
+    return sum(
+        1 for codepoint in target_valid if source_pool.source_for(codepoint) is not None
+    )
+
+
+def dataset_max_chars_per_font(dataset_dir: str | Path) -> int:
+    counts = []
+    for metadata_path in (Path(dataset_dir) / "train").glob("*/metadata.json"):
+        try:
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            counts.append(int(metadata.get("extracted_count") or 0))
+        except (OSError, ValueError, json.JSONDecodeError):
+            continue
+    return max(counts, default=0)
 
 
 def clamp_training_retry_command(
@@ -176,7 +245,11 @@ def dataset_command(
     workers: int,
 ) -> tuple[list[str], Path]:
     project_dir = storage.project_dir(manifest.id)
-    output = project_dir / "datasets" / f"dataset-{charset}"
+    output = (
+        project_dir
+        / "datasets"
+        / f"dataset-{charset}-train{train_count}-test{test_count}"
+    )
     charset_region = {
         "gb2312": "SC",
         "gbk": "SC",
@@ -283,6 +356,9 @@ def training_command(
     manifest.training["dataset_path"] = str(dataset_dir)
     storage.save_project(manifest)
     preset["dataset_path"] = str(dataset_dir)
+    extracted_per_font = dataset_max_chars_per_font(dataset_dir)
+    if extracted_per_font:
+        preset["max_chars_per_font"] = extracted_per_font
     fingerprint = hashlib.sha256()
     for path in sorted(dataset_dir.rglob("metadata.json")):
         fingerprint.update(str(path.relative_to(dataset_dir)).encode("utf-8"))

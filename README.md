@@ -97,6 +97,14 @@ python scripts/generate_font_dataset.py \
     --output-dir data/sample_dataset
 ```
 
+Dataset generation does not require a charset by default. It scans for
+outlined CJK glyphs shared by the ordered source-font collection and target
+font, then uses fixed seeds to produce disjoint training and validation splits.
+GB2312, GBK, Big5, JIS X 0208 and KS X 1001 remain available only as optional
+advanced range filters. The WebUI defaults to 3,000 training and 64 validation
+glyphs, offers a 6,000/128 coverage preset after capacity analysis, and trains
+on the actual extracted count recorded in dataset metadata.
+
 #### Training dashboard
 
 Each run records TensorBoard events and an append-only `metrics.jsonl`. The

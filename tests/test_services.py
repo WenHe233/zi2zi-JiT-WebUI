@@ -1,7 +1,9 @@
 import pytest
 
 from zi2zi_webui.services import (
+    dataset_max_chars_per_font,
     dataset_command,
+    dataset_size_preset,
     infer_checkpoint_model,
     resolve_training_dataset,
 )
@@ -17,7 +19,7 @@ def test_dataset_command_passes_ordered_regional_and_global_source_fonts(tmp_pat
     project.regional_source_fonts["JP"] = ["jigmo-1.ttf", "jigmo-2.ttf"]
     project.target_assets = ["target.ttf"]
 
-    command, _ = dataset_command(
+    command, output = dataset_command(
         project,
         storage,
         train_count=100,
@@ -32,6 +34,29 @@ def test_dataset_command_passes_ordered_regional_and_global_source_fonts(tmp_pat
         "global-1.ttf",
         "global-2.ttf",
     ]
+    assert "train100-test8" in str(output)
+
+
+def test_auto_dataset_uses_ordered_global_fonts_without_a_region_filter(tmp_path):
+    storage = Storage(tmp_path / "state")
+    project = storage.create_project("Automatic")
+    project.input_mode = "font"
+    project.global_source_fonts = ["jigmo-1.ttf", "jigmo-2.ttf"]
+    project.target_assets = ["target.ttf"]
+
+    command, output = dataset_command(
+        project,
+        storage,
+        train_count=3000,
+        test_count=64,
+        charset="auto",
+        workers=2,
+    )
+
+    start = command.index("--source-font") + 1
+    assert command[start : start + 2] == ["jigmo-1.ttf", "jigmo-2.ttf"]
+    assert command[command.index("--charset") + 1] == "auto"
+    assert "dataset-auto-train3000-test64" in str(output)
 
 
 def test_checkpoint_variant_is_inferred_from_official_filename():
@@ -64,3 +89,12 @@ def test_single_epoch_training_always_saves_last_checkpoint():
     assert periodic_or_final(epoch=0, total_epochs=1, frequency=10)
     assert not periodic_or_final(epoch=0, total_epochs=10, frequency=10)
     assert periodic_or_final(epoch=9, total_epochs=200, frequency=10)
+
+
+def test_dataset_size_presets_and_generated_sample_count(tmp_path):
+    assert dataset_size_preset("balanced") == (3000, 64)
+    dataset = tmp_path / "dataset"
+    metadata = dataset / "train" / "001_font" / "metadata.json"
+    metadata.parent.mkdir(parents=True)
+    metadata.write_text('{"extracted_count": 2875}', encoding="utf-8")
+    assert dataset_max_chars_per_font(dataset) == 2875

@@ -65,9 +65,12 @@ def get_args() -> argparse.Namespace:
     parser.add_argument("--test-seed", type=int, default=99999, help="Random seed for testing (default: 99999).")
 
     # Shared
-    parser.add_argument("--charset", type=str, default="gb2312",
-                        choices=["gb2312", "gbk", "big5", "jisx0208", "ksx1001"],
-                        help="Charset filter (default: gb2312).")
+    parser.add_argument("--charset", type=str, default="auto",
+                        choices=["auto", "gb2312", "gbk", "big5", "jisx0208", "ksx1001", "all-cjk"],
+                        help=(
+                            "Optional range filter. 'auto' detects all outlined CJK glyphs "
+                            "shared by the ordered source-font collection and target font."
+                        ))
     parser.add_argument("--resolution", type=int, default=256, help="Glyph resolution (default: 256).")
     parser.add_argument("--num-workers", type=int, default=4, help="Parallel workers for font processing (default: 4).")
 

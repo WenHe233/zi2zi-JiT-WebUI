@@ -30,6 +30,8 @@ from .services import (
     clamp_training_retry_command,
     copy_project_input,
     dataset_command,
+    dataset_size_preset,
+    font_dataset_capacity,
     generation_command,
     import_model,
     infer_checkpoint_model,
@@ -233,18 +235,49 @@ def build_app(
 
     def queue_dataset(project_id, train_count, test_count, charset, workers):
         project = storage.get_project(project_id)
+        train_count = int(train_count)
+        test_count = int(test_count)
+        if train_count < 9:
+            raise gr.Error("Training needs at least 9 distinct glyphs")
+        if test_count < 1:
+            raise gr.Error("Validation glyph count must be at least 1")
+        capacity = font_dataset_capacity(project, charset)
+        if train_count + test_count > capacity:
+            raise gr.Error(
+                f"The selected fonts and optional range filter have {capacity} usable common glyphs. "
+                f"Training + validation requested {train_count + test_count}; reduce training "
+                f"to at most {max(capacity - test_count, 0)}."
+            )
         command, output = dataset_command(
             project,
             storage,
-            train_count=int(train_count),
-            test_count=int(test_count),
+            train_count=train_count,
+            test_count=test_count,
             charset=charset,
             workers=int(workers),
         )
         project.training["dataset_path"] = str(output)
         storage.save_project(project)
         job_id = jobs.submit("dataset", command, project_id=project_id, cwd=ROOT)
-        return str(output), f"Queued dataset job: {job_id}"
+        return (
+            str(output),
+            f"Queued dataset job: {job_id}. Usable glyph capacity: {capacity}; "
+            f"training: {train_count}; held-out validation: {test_count}.",
+        )
+
+    def analyze_dataset_capacity(project_id, charset, test_count):
+        if not project_id:
+            raise gr.Error("Select a project")
+        capacity = font_dataset_capacity(storage.get_project(project_id), charset)
+        test_count = max(int(test_count), 1)
+        return (
+            f"**{b('可用公共字形', 'Usable common glyphs')}：{capacity}**  \n"
+            f"{b('在保留验证集后，训练字形最多可设为', 'Maximum training glyphs after holding out validation')}"
+            f"：{max(capacity - test_count, 0)}"
+        )
+
+    def apply_dataset_size_preset(name):
+        return dataset_size_preset(name)
 
     def project_dataset_path(project_id):
         if not project_id:
@@ -895,15 +928,66 @@ def build_app(
             asset_status = gr.Code(label=b("素材状态", "Asset status"), language="json")
 
         with gr.Tab(t("dataset")):
-            with gr.Row():
-                train_count = gr.Number(value=500, precision=0, label=b("训练字形数", "Training glyphs"))
-                test_count = gr.Number(value=8, precision=0, label=b("测试字形数", "Test glyphs"))
-                dataset_charset = gr.Dropdown(
-                    choices=["gb2312", "gbk", "big5", "jisx0208", "ksx1001"],
-                    value="gb2312",
-                    label=b("数据集字符集", "Dataset charset"),
+            gr.Markdown(
+                b(
+                    "默认自动扫描有真实轮廓的公共 CJK 字形：源字体集合中任一字体可提供、"
+                    "且目标字体也包含的字形会进入候选池，再以固定 seed 拆分为训练集和"
+                    "不重叠的验证集。无需先指定字符集。",
+                    "By default, the app detects outlined CJK glyphs shared by the ordered "
+                    "source-font collection and target font, then uses fixed seeds to create "
+                    "disjoint training and validation splits. No charset selection is required.",
                 )
+            )
+            dataset_scale = gr.Dropdown(
+                choices=[
+                    (b("快速验证：500 / 8", "Quick check: 500 / 8"), "quick"),
+                    (b("均衡训练：3000 / 64", "Balanced: 3000 / 64"), "balanced"),
+                    (b("高覆盖：6000 / 128", "High coverage: 6000 / 128"), "coverage"),
+                ],
+                value="balanced",
+                label=b("数据集规模预设（训练 / 验证）", "Dataset size preset (train / validation)"),
+            )
+            with gr.Row():
+                train_count = gr.Number(value=3000, precision=0, label=b("训练字形数", "Training glyphs"))
+                test_count = gr.Number(value=64, precision=0, label=b("验证字形数", "Validation glyphs"))
                 workers = gr.Number(value=4, precision=0, label=b("工作进程", "Workers"))
+            with gr.Accordion(
+                b("高级：可选字符范围过滤", "Advanced: optional character-range filter"),
+                open=False,
+            ):
+                dataset_charset = gr.Dropdown(
+                    choices=[
+                        (b("自动检测全部公共字形（推荐）", "Auto-detect all common glyphs (recommended)"), "auto"),
+                        ("GB2312", "gb2312"),
+                        ("GBK", "gbk"),
+                        ("Big5", "big5"),
+                        ("JIS X 0208", "jisx0208"),
+                        ("KS X 1001", "ksx1001"),
+                        (b("全部 CJK 范围（兼容旧项目）", "All CJK ranges (legacy alias)"), "all-cjk"),
+                    ],
+                    value="auto",
+                    label=b("字形范围过滤", "Glyph range filter"),
+                )
+                gr.Markdown(
+                    b(
+                        "过滤器只用于限制候选范围；无论选择哪项，实际样本仍必须同时存在于"
+                        "源字体集合和目标字体，并包含有效轮廓。",
+                        "A filter only narrows the candidate range. Every sample must still "
+                        "have a valid outline in both the source-font collection and target font.",
+                    )
+                )
+            analyze_capacity_btn = gr.Button(
+                b("分析当前字体可用容量", "Analyze usable glyph capacity")
+            )
+            dataset_capacity_status = gr.Markdown()
+            gr.Markdown(
+                b(
+                    "样本数应增加“不同字符”，而不是复制同一图片。训练会自动使用数据集"
+                    "实际生成的全部字形；训练耗时约随样本数线性增加。",
+                    "Increase distinct glyphs rather than duplicating images. Training now uses "
+                    "all glyphs actually generated; runtime grows roughly linearly with sample count.",
+                )
+            )
             queue_dataset_btn = gr.Button(b("构建数据集", "Build dataset"), variant="primary")
             dataset_path = gr.Textbox(label=b("数据集路径", "Dataset path"))
             dataset_status = gr.Markdown()
@@ -1097,6 +1181,16 @@ def build_app(
             attach_shared_model,
             [project_selector, shared_model],
             shared_model_status,
+        )
+        dataset_scale.change(
+            apply_dataset_size_preset,
+            dataset_scale,
+            [train_count, test_count],
+        )
+        analyze_capacity_btn.click(
+            analyze_dataset_capacity,
+            [project_selector, dataset_charset, test_count],
+            dataset_capacity_status,
         )
         queue_dataset_btn.click(
             queue_dataset,

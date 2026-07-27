@@ -80,8 +80,14 @@ python scripts/generate_font_dataset.py \
     --output-dir data/sample_dataset
 ```
 
+数据集默认不要求指定字符集。系统会扫描源字体集合与目标字体中实际存在且具有有效
+轮廓的公共 CJK 字形，再使用固定 seed 自动拆分为互不重叠的训练集和验证集。字符范围
+（GB2312、GBK、Big5、JIS X 0208、KS X 1001）只作为高级可选过滤器。WebUI 默认
+使用 3000 个训练字形和 64 个验证字形，也可先分析字体容量后提高到 6000/128；
+训练程序会读取生成元数据并使用实际提取的全部训练字形。
+
 训练仪表盘同时记录 TensorBoard 和 `metrics.jsonl`，显示 loss/EMA、学习率、
-吞吐、ETA、GPU/CPU/RAM/磁盘、固定字形快照及 SSIM、LPIPS、L1、FID。可叠加
+吞吐、ETA、GPU/CPU/RAM/磁盘、训练字形演变及 SSIM、LPIPS、L1、FID。可叠加
 比较同项目最多五次训练，并导出 CSV/JSON 与当前图表 PNG。启用完整评估后保留 `last`、
 `best-SSIM`、`best-LPIPS` checkpoint；早停默认关闭。
 
