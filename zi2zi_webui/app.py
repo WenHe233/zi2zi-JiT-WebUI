@@ -27,6 +27,7 @@ from .presets import (
 )
 from .services import (
     ROOT,
+    clamp_training_retry_command,
     copy_project_input,
     dataset_command,
     generation_command,
@@ -703,6 +704,10 @@ def build_app(
         if not variant:
             raise gr.Error("Cannot infer checkpoint architecture for retry")
         command[model_index] = variant
+        command, safety_changes = clamp_training_retry_command(
+            command,
+            str(job.get("gpu") or ""),
+        )
         requested_dataset = Path(command[data_index]).parent
         project = storage.get_project(job["project_id"])
         dataset = resolve_training_dataset(project, storage, requested_dataset)
@@ -723,9 +728,18 @@ def build_app(
             resume_point=job.get("resume_point"),
         )
         storage.replace_training_job(job["project_id"], job_id, new_id)
+        safety_note = (
+            "; safety limits "
+            + ", ".join(
+                f"{name} {before}→{after}"
+                for name, (before, after) in safety_changes.items()
+            )
+            if safety_changes
+            else ""
+        )
         return (
             f"Retried training as {new_id} with architecture {variant}; "
-            f"dataset {dataset}"
+            f"dataset {dataset}{safety_note}"
         )
 
     with gr.Blocks(title=t("app_title"), theme=gr.themes.Soft()) as app:

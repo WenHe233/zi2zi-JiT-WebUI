@@ -22,6 +22,47 @@ OFFICIAL_MODELS = {
 }
 
 
+def clamp_training_retry_command(
+    command: list[str],
+    device_id: str,
+) -> tuple[list[str], dict[str, tuple[int, int]]]:
+    """Apply current hardware-safe limits to a historical training command."""
+    updated = list(command)
+
+    def option(name: str, default: int = 0) -> int:
+        try:
+            return int(updated[updated.index(name) + 1])
+        except (ValueError, IndexError, TypeError):
+            return default
+
+    try:
+        model_variant = updated[updated.index("--model") + 1]
+    except (ValueError, IndexError):
+        return updated, {}
+    device = next((item for item in detect_devices() if item.id == str(device_id)), None)
+    if not device or not device.training_supported:
+        return updated, {}
+    rank = option("--lora_r", 32)
+    quality = "quality" if rank >= 64 else "economy" if rank <= 16 else "balanced"
+    safe = training_preset(device, quality, model_variant)
+    changes: dict[str, tuple[int, int]] = {}
+    for argument, preset_key in (
+        ("--batch_size", "batch_size"),
+        ("--gen_bsz", "gen_bsz"),
+        ("--num_workers", "num_workers"),
+    ):
+        try:
+            value_index = updated.index(argument) + 1
+            current = int(updated[value_index])
+        except (ValueError, IndexError, TypeError):
+            continue
+        limit = int(safe[preset_key])
+        if current > limit:
+            updated[value_index] = str(limit)
+            changes[argument] = (current, limit)
+    return updated, changes
+
+
 def infer_checkpoint_model(path: str | Path, metadata: dict[str, Any] | None = None) -> str | None:
     metadata = metadata or {}
     configured = str(metadata.get("model") or "")
