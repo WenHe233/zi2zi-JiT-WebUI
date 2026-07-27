@@ -41,6 +41,44 @@ from .storage import Storage
 from .telemetry import export_metrics_csv, export_metrics_json, read_metrics
 
 
+def training_snapshot_items(
+    records: list[tuple[str, list[dict[str, Any]]]],
+    language: str = "zh",
+    limit: int = 24,
+) -> list[tuple[str, str]]:
+    items: list[tuple[str, str]] = []
+    seen: set[tuple[str, int, str]] = set()
+    for run_id, events in records:
+        for event in events:
+            if event.get("phase") != "evaluation":
+                continue
+            try:
+                epoch_number = int(event.get("epoch", 0)) + 1
+            except (TypeError, ValueError):
+                epoch_number = 1
+            snapshot_root = Path(str(event.get("snapshot_path") or ""))
+            if not snapshot_root.is_dir():
+                continue
+            for path in sorted(snapshot_root.glob("*.png")):
+                key = (run_id, epoch_number, str(path.resolve()))
+                if key in seen:
+                    continue
+                seen.add(key)
+                try:
+                    group_number = int(path.stem.rsplit("_", 1)[-1]) + 1
+                except ValueError:
+                    group_number = 1
+                caption = (
+                    f"Run {run_id} · 第 {epoch_number} 轮 · 第 {group_number} 组"
+                    f"（每对：目标真值 → 当前生成）"
+                    if language != "en"
+                    else f"Run {run_id} · Epoch {epoch_number} · Group {group_number} "
+                    f"(each pair: target → generated)"
+                )
+                items.append((str(path), caption))
+    return items[-limit:]
+
+
 def build_app(
     storage: Storage,
     jobs: JobManager,
@@ -379,13 +417,7 @@ def build_app(
             for event in events
             if event.get("alert") or event.get("phase") == "fatal"
         ]
-        snapshots = [
-            str(path)
-            for _run_id, events in records
-            for event in events
-            if event.get("phase") == "evaluation"
-            for path in Path(event.get("snapshot_path", "")).glob("*.png")
-        ]
+        snapshots = training_snapshot_items(records, language)
         if selected and selected[0].get("error"):
             summary = (
                 f"**{b('训练失败原因', 'Training failure reason')}：** "
@@ -404,7 +436,7 @@ def build_app(
             summary,
             checkpoints,
             alerts,
-            snapshots[-24:],
+            snapshots,
         )
 
     def export_run_metrics(project_id, run_ids):
@@ -929,8 +961,22 @@ def build_app(
                 label=b("告警", "Alerts"),
                 interactive=False,
             )
+            gr.Markdown(
+                b(
+                    "使用相同验证字符和 Seed 观察训练进展；对比图中每一对左侧为目标真值，"
+                    "右侧为该轮模型的生成结果。",
+                    "The same validation glyphs and seed are reused across epochs. In each pair, "
+                    "the target is on the left and that epoch's generated glyph is on the right.",
+                )
+            )
             snapshot_gallery = gr.Gallery(
-                label=b("固定字形快照时间轴", "Fixed-glyph snapshot timeline"), columns=4, height=360
+                label=b(
+                    "训练字形演变（固定字符与 Seed）",
+                    "Training glyph evolution (fixed glyphs and seed)",
+                ),
+                columns=2,
+                height="auto",
+                object_fit="contain",
             )
             gr.HTML(
                 f'<a href="{tensorboard_url}" target="_blank">'
