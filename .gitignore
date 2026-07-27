@@ -49,6 +49,27 @@ runs/
 wandb/
 tensorboard/
 events.out.tfevents.*
+*.pth
+*.pt
+*.ckpt
+*.safetensors
+*.npy
+*.npz
+metrics.jsonl
+metrics-*.jsonl
+training-report.html
+
+# Local state databases
+*.sqlite
+*.sqlite3
+*.sqlite3-shm
+*.sqlite3-wal
+
+# Imported and generated font binaries
+*.ttf
+*.otf
+*.woff
+*.woff2
 
 # Temp files
 tmp/
