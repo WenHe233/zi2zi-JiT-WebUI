@@ -79,6 +79,11 @@ remain available for inference only. The WebUI binds to localhost by default
 and has no multi-user authentication; do not expose it to an untrusted
 network.
 
+The Projects page danger zone can permanently delete a selected project and
+all of its assets, datasets, training runs, checkpoints, generated results,
+fonts, and job records. Shared models are retained. Explicit confirmation is
+required, and queued or running project jobs must be cancelled first.
+
 #### Source font collections
 
 The global source and each SC/TC/JP/KR source can be an ordered collection of

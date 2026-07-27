@@ -53,6 +53,10 @@ python webui.py
 <http://127.0.0.1:6006>。模型、项目与生成产物默认保存在已被 Git 忽略的
 `webui_data/`。
 
+项目页的“危险操作”可以永久删除所选项目及其全部素材、数据集、训练运行、
+checkpoint、生成结果、字体和任务记录；共享模型库不会被删除。删除前需要明确确认，
+且必须先取消该项目仍在排队或运行中的任务。
+
 也可以运行 `start_webui.bat`（Windows）、`./start_webui.sh`（Linux），或使用
 NVIDIA Docker：
 

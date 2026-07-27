@@ -30,6 +30,65 @@ def test_training_run_round_trip(tmp_path):
     assert not run_dir.exists()
 
 
+def test_delete_project_removes_files_runs_and_job_records(tmp_path):
+    storage = Storage(tmp_path / "state")
+    project = storage.create_project("Disposable")
+    run = TrainingRun(project_id=project.id, parameters={})
+    storage.save_training_run(run)
+    artifact = storage.project_dir(project.id) / "generation" / "glyph.png"
+    artifact.write_bytes(b"glyph")
+    with storage._connect() as db:
+        db.execute(
+            """
+            INSERT INTO jobs(
+                id, project_id, job_type, status, command_json, cwd, gpu,
+                env_json, log_path, created_at
+            ) VALUES ('done-job', ?, 'test', 'succeeded', '[]', '.', NULL, '{}', 'x.log', 'now')
+            """,
+            (project.id,),
+        )
+
+    deleted = storage.delete_project(project.id)
+
+    assert deleted.name == "Disposable"
+    assert not storage.project_dir(project.id).exists()
+    assert storage.list_projects() == []
+    with storage._connect() as db:
+        assert db.execute(
+            "SELECT COUNT(*) AS count FROM training_runs WHERE project_id=?",
+            (project.id,),
+        ).fetchone()["count"] == 0
+        assert db.execute(
+            "SELECT COUNT(*) AS count FROM jobs WHERE project_id=?",
+            (project.id,),
+        ).fetchone()["count"] == 0
+
+
+def test_delete_project_rejects_active_jobs(tmp_path):
+    storage = Storage(tmp_path / "state")
+    project = storage.create_project("Busy")
+    with storage._connect() as db:
+        db.execute(
+            """
+            INSERT INTO jobs(
+                id, project_id, job_type, status, command_json, cwd, gpu,
+                env_json, log_path, created_at
+            ) VALUES ('active-job', ?, 'training', 'queued', '[]', '.', NULL, '{}', 'x.log', 'now')
+            """,
+            (project.id,),
+        )
+
+    try:
+        storage.delete_project(project.id)
+    except ValueError as exc:
+        assert "active-job" in str(exc)
+    else:
+        raise AssertionError("Expected active job deletion to be rejected")
+
+    assert storage.project_dir(project.id).is_dir()
+    assert storage.get_project(project.id).name == "Busy"
+
+
 def test_running_jobs_become_interrupted_on_restart(tmp_path):
     storage = Storage(tmp_path / "state")
     with storage._connect() as db:

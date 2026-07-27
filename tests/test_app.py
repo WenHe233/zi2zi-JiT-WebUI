@@ -90,3 +90,25 @@ def test_training_snapshot_gallery_uses_page_scrolling(tmp_path):
         assert gallery.columns == 2
     finally:
         jobs.stop()
+
+
+def test_project_page_has_confirmed_danger_zone_deletion(tmp_path):
+    storage = Storage(tmp_path / "state")
+    jobs = JobManager(storage)
+    try:
+        app = build_app(storage, jobs, language="en")
+        delete_button = next(
+            block
+            for block in app.blocks.values()
+            if getattr(block, "value", "") == "Delete project and files"
+        )
+        confirmation = next(
+            block
+            for block in app.blocks.values()
+            if getattr(block, "label", "")
+            == "Confirm permanent deletion of the current project and all files"
+        )
+        assert delete_button.variant == "stop"
+        assert confirmation.value is False
+    finally:
+        jobs.stop()

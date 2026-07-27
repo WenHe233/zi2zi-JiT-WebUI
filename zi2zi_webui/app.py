@@ -125,6 +125,32 @@ def build_app(
         choices = project_choices()
         return gr.update(choices=choices, value=choices[0][1] if choices else None)
 
+    def delete_project_action(project_id, confirmed):
+        if not project_id:
+            raise gr.Error("Select a project first")
+        if not confirmed:
+            raise gr.Error("Confirm permanent project deletion first")
+        try:
+            deleted = storage.delete_project(project_id)
+        except KeyError as exc:
+            raise gr.Error("The selected project no longer exists") from exc
+        except (ValueError, OSError) as exc:
+            raise gr.Error(str(exc)) from exc
+        choices = project_choices()
+        next_project_id = choices[0][1] if choices else None
+        next_manifest = (
+            project_summary(next_project_id) if next_project_id else "{}"
+        )
+        return (
+            gr.update(choices=choices, value=next_project_id),
+            next_manifest,
+            (
+                f"{b('已永久删除项目及其文件', 'Permanently deleted project and its files')}: "
+                f"{deleted.name} ({deleted.id})"
+            ),
+            False,
+        )
+
     def project_summary(project_id):
         if not project_id:
             return "{}"
@@ -876,6 +902,28 @@ def build_app(
                 f"**{b('数据根目录', 'Data root')}:** `{storage.root}` · "
                 f"**{b('磁盘可用', 'Free disk')}:** {disk_free_gb(storage.root)} GB"
             )
+            with gr.Accordion(b("危险操作", "Danger zone"), open=False):
+                gr.Markdown(
+                    b(
+                        "永久删除当前项目、训练运行、任务记录，以及项目目录中的素材、"
+                        "数据集、checkpoint、生成结果和字体。共享模型库不会被删除。"
+                        "若项目仍有运行中或排队中的任务，必须先取消。",
+                        "Permanently delete the current project, training runs, job records, "
+                        "and all project assets, datasets, checkpoints, generated results, "
+                        "and fonts. Shared models are retained. Active jobs must be cancelled first.",
+                    )
+                )
+                with gr.Row():
+                    confirm_delete_project = gr.Checkbox(
+                        label=b(
+                            "确认永久删除当前项目及全部文件",
+                            "Confirm permanent deletion of the current project and all files",
+                        )
+                    )
+                    delete_project_btn = gr.Button(
+                        b("删除项目及文件", "Delete project and files"),
+                        variant="stop",
+                    )
 
         with gr.Tab(t("model_assets")):
             gr.Markdown(
@@ -1161,10 +1209,24 @@ def build_app(
         create_project_btn.click(
             create_project, new_project_name, [project_selector, project_status]
         )
+        delete_project_btn.click(
+            delete_project_action,
+            [project_selector, confirm_delete_project],
+            [
+                project_selector,
+                project_json,
+                project_status,
+                confirm_delete_project,
+            ],
+        )
         refresh_projects_btn.click(refresh_projects, outputs=project_selector)
         project_selector.change(project_summary, project_selector, project_json)
         project_selector.change(project_dataset_path, project_selector, dataset_path)
         project_selector.change(run_choices, project_selector, run_selector)
+        project_selector.change(
+            lambda: False,
+            outputs=confirm_delete_project,
+        )
         save_assets_btn.click(
             save_assets,
             [project_selector, input_mode, source_font, target_files, sc_font, tc_font, jp_font, kr_font],
