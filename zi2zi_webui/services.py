@@ -235,7 +235,8 @@ def training_command(
     device = next((item for item in detect_devices() if item.id == device_id), None)
     if not device or not device.training_supported:
         raise ValueError("LoRA training requires an NVIDIA CUDA device")
-    preset = training_preset(device, quality)
+    model_variant = str((overrides or {}).get("model") or "") or None
+    preset = training_preset(device, quality, model_variant)
     preset.update(overrides or {})
     dataset_dir = resolve_training_dataset(manifest, storage, dataset_dir)
     manifest.training["dataset_path"] = str(dataset_dir)

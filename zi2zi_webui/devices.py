@@ -39,7 +39,11 @@ def detect_devices() -> list[DeviceInfo]:
     return devices
 
 
-def training_preset(device: DeviceInfo, quality: str = "balanced") -> dict[str, int | float | bool]:
+def training_preset(
+    device: DeviceInfo,
+    quality: str = "balanced",
+    model_variant: str | None = None,
+) -> dict[str, int | float | bool]:
     memory = device.memory_total_gb or 0
     if quality == "economy" or memory < 8:
         return {
@@ -52,11 +56,20 @@ def training_preset(device: DeviceInfo, quality: str = "balanced") -> dict[str, 
             "full_eval": False,
             "eval_freq": 40,
         }
-    if quality == "quality" and memory >= 16:
+    if quality == "quality":
+        large_model = model_variant == "JiT-L/16"
+        if large_model and memory < 24:
+            batch_size = 12 if memory >= 16 else 8
+            generation_batch_size = 8 if memory >= 16 else 4
+            workers = 6 if memory >= 16 else 4
+        else:
+            batch_size = 32
+            generation_batch_size = 16
+            workers = 8
         return {
-            "batch_size": 32,
-            "gen_bsz": 16,
-            "num_workers": 8,
+            "batch_size": batch_size,
+            "gen_bsz": generation_batch_size,
+            "num_workers": workers,
             "lora_r": 64,
             "lora_alpha": 64,
             "snapshot_freq": 10,
