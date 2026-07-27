@@ -20,7 +20,7 @@ from util.lora_utils import (
     add_lora_args,
 )
 from main_jit import FontSrcTargetRefsDataset, collate_src_target_refs, get_args_parser
-from util.crop import resize_and_random_crop
+from util.crop import ResizeAndRandomCrop
 from util.misc import save_model_no_ema
 import util.misc as misc
 
@@ -48,7 +48,7 @@ def main(args):
         log_writer = None
 
     transform_train = transforms.Compose([
-        transforms.Lambda(lambda img: resize_and_random_crop(img, args.img_size)),
+        ResizeAndRandomCrop(args.img_size),
         transforms.RandomHorizontalFlip(),
         transforms.PILToTensor()
     ])

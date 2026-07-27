@@ -89,6 +89,17 @@ def summarize_failure(log_path: str | Path, return_code: int) -> str:
             "Training dataset directory is missing. Generate or select a dataset "
             "containing train/ and test.npz, then retry."
         )
+    if "Can't pickle local object" in text:
+        return (
+            "A DataLoader worker could not start on Windows because the training "
+            "transform is not serializable. Update the training code and retry; "
+            "the trailing EOFError is only a secondary worker-process error."
+        )
+    if "Cannot find a working triton installation" in text:
+        return (
+            "torch.compile tried to use Triton, but no working Triton installation "
+            "is available. The model must fall back to eager execution on this system."
+        )
     exception_lines = re.findall(
         r"^(?:[A-Za-z_][\w.]*)(?:Error|Exception):\s+.+$",
         text,

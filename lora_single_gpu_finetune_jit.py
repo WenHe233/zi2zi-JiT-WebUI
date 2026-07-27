@@ -21,8 +21,9 @@ from util.lora_utils import (
     _is_lora_state_dict,
 )
 from main_jit import FontSrcTargetRefsDataset, collate_src_target_refs
-from util.crop import resize_and_random_crop
+from util.crop import ResizeAndRandomCrop
 from util.misc import save_model_no_ema
+from util.training_schedule import periodic_or_final
 import util.misc as misc
 from zi2zi_webui.telemetry import MetricsWriter, write_training_report
 
@@ -138,7 +139,7 @@ def main(args):
     metrics_writer = MetricsWriter(args.metrics_jsonl, args.run_id) if args.metrics_jsonl else None
 
     transform_train = transforms.Compose([
-        transforms.Lambda(lambda img: resize_and_random_crop(img, args.img_size)),
+        ResizeAndRandomCrop(args.img_size),
         transforms.RandomHorizontalFlip(),
         transforms.PILToTensor()
     ])
@@ -269,7 +270,7 @@ def main(args):
                                    log_writer=log_writer, args=args,
                                    metrics_writer=metrics_writer, run_start_time=start_time)
 
-        if epoch > 0 and (epoch % args.save_last_freq == 0 or epoch + 1 == args.epochs):
+        if periodic_or_final(epoch, args.epochs, args.save_last_freq):
             save_model_no_ema(
                 args=args,
                 model_without_ddp=model,

@@ -12,7 +12,7 @@ from torch.utils.tensorboard import SummaryWriter
 import torchvision.transforms as transforms
 from PIL import Image
 
-from util.crop import resize_and_random_crop
+from util.crop import ResizeAndRandomCrop
 import util.misc as misc
 
 import copy
@@ -252,7 +252,7 @@ def main(args):
 
     # Data augmentation transforms
     transform_train = transforms.Compose([
-        transforms.Lambda(lambda img: resize_and_random_crop(img, args.img_size)),
+        ResizeAndRandomCrop(args.img_size),
         transforms.RandomHorizontalFlip(),
         transforms.PILToTensor()
     ])

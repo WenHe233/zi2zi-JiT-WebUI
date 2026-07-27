@@ -3,6 +3,23 @@ from PIL import Image
 import torch
 
 
+class ResizeAndRandomCrop:
+    """Pickle-safe transform for Windows DataLoader worker processes."""
+
+    def __init__(self, image_size, scale_min=1.0, scale_max=1.1):
+        self.image_size = image_size
+        self.scale_min = scale_min
+        self.scale_max = scale_max
+
+    def __call__(self, pil_image):
+        return resize_and_random_crop(
+            pil_image,
+            self.image_size,
+            self.scale_min,
+            self.scale_max,
+        )
+
+
 def resize_and_random_crop(pil_image, image_size, scale_min=1.0, scale_max=1.1):
     scale = scale_min + torch.rand(1).item() * (scale_max - scale_min)
     enlarged_size = int(image_size * scale)

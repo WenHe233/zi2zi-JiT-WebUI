@@ -6,6 +6,7 @@ from zi2zi_webui.services import (
     resolve_training_dataset,
 )
 from zi2zi_webui.storage import Storage
+from util.training_schedule import periodic_or_final
 
 
 def test_dataset_command_passes_ordered_regional_and_global_source_fonts(tmp_path):
@@ -57,3 +58,9 @@ def test_training_dataset_requires_train_directory_and_test_npz(tmp_path):
 
     with pytest.raises(ValueError, match="train/ and test.npz"):
         resolve_training_dataset(project, storage, dataset)
+
+
+def test_single_epoch_training_always_saves_last_checkpoint():
+    assert periodic_or_final(epoch=0, total_epochs=1, frequency=10)
+    assert not periodic_or_final(epoch=0, total_epochs=10, frequency=10)
+    assert periodic_or_final(epoch=9, total_epochs=200, frequency=10)

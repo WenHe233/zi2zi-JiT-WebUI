@@ -58,6 +58,27 @@ def test_failure_summary_explains_missing_training_dataset(tmp_path):
     assert "Training dataset directory is missing" in summarize_failure(log, 1)
 
 
+def test_failure_summary_prefers_windows_pickle_root_cause_over_eof(tmp_path):
+    log = tmp_path / "failed.log"
+    log.write_text(
+        "AttributeError: Can't pickle local object 'main.<locals>.<lambda>'\n"
+        "EOFError: Ran out of input\n",
+        encoding="utf-8",
+    )
+    summary = summarize_failure(log, 1)
+    assert "DataLoader worker could not start on Windows" in summary
+    assert "secondary" in summary
+
+
+def test_failure_summary_explains_missing_triton_fallback(tmp_path):
+    log = tmp_path / "failed.log"
+    log.write_text(
+        "RuntimeError: Cannot find a working triton installation.\n",
+        encoding="utf-8",
+    )
+    assert "fall back to eager execution" in summarize_failure(log, 1)
+
+
 def test_live_job_progress_is_persisted(tmp_path):
     storage = Storage(tmp_path / "state")
     manager = JobManager(storage)
