@@ -187,6 +187,41 @@ def dataset_command(
     return command, output
 
 
+def resolve_training_dataset(
+    manifest: ProjectManifest,
+    storage: Storage,
+    requested: str | Path | None = None,
+) -> Path:
+    """Return a complete dataset, falling back to the project's newest dataset."""
+    candidates: list[Path] = []
+    requested_text = str(requested or "").strip()
+    stored_text = str(manifest.training.get("dataset_path") or "").strip()
+    for value in (requested_text, stored_text):
+        if value:
+            candidate = Path(value).expanduser().resolve()
+            if candidate not in candidates:
+                candidates.append(candidate)
+
+    datasets_root = storage.project_dir(manifest.id) / "datasets"
+    if datasets_root.is_dir():
+        discovered = sorted(
+            (path for path in datasets_root.iterdir() if path.is_dir()),
+            key=lambda path: path.stat().st_mtime_ns,
+            reverse=True,
+        )
+        candidates.extend(path.resolve() for path in discovered if path.resolve() not in candidates)
+
+    for candidate in candidates:
+        if (candidate / "train").is_dir() and (candidate / "test.npz").is_file():
+            return candidate
+
+    checked = ", ".join(str(path) for path in candidates) or str(datasets_root)
+    raise ValueError(
+        "No complete training dataset was found. Generate the dataset first; "
+        f"expected both train/ and test.npz under: {checked}"
+    )
+
+
 def training_command(
     manifest: ProjectManifest,
     storage: Storage,
@@ -202,7 +237,9 @@ def training_command(
         raise ValueError("LoRA training requires an NVIDIA CUDA device")
     preset = training_preset(device, quality)
     preset.update(overrides or {})
-    dataset_dir = Path(dataset_dir).expanduser().resolve()
+    dataset_dir = resolve_training_dataset(manifest, storage, dataset_dir)
+    manifest.training["dataset_path"] = str(dataset_dir)
+    storage.save_project(manifest)
     preset["dataset_path"] = str(dataset_dir)
     fingerprint = hashlib.sha256()
     for path in sorted(dataset_dir.rglob("metadata.json")):

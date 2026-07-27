@@ -48,6 +48,16 @@ def test_failure_summary_explains_checkpoint_architecture_mismatch(tmp_path):
     assert "JiT-B/16 vs JiT-L/16" in summarize_failure(log, 1)
 
 
+def test_failure_summary_explains_missing_training_dataset(tmp_path):
+    log = tmp_path / "failed.log"
+    log.write_text(
+        "FileNotFoundError: [WinError 3] path not found: "
+        "'C:\\\\repo\\\\train'\n",
+        encoding="utf-8",
+    )
+    assert "Training dataset directory is missing" in summarize_failure(log, 1)
+
+
 def test_live_job_progress_is_persisted(tmp_path):
     storage = Storage(tmp_path / "state")
     manager = JobManager(storage)

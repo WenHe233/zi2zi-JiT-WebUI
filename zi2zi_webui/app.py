@@ -33,6 +33,7 @@ from .services import (
     import_model,
     infer_checkpoint_model,
     queue_official_model_download,
+    resolve_training_dataset,
     training_command,
 )
 from .storage import Storage
@@ -201,8 +202,22 @@ def build_app(
             charset=charset,
             workers=int(workers),
         )
+        project.training["dataset_path"] = str(output)
+        storage.save_project(project)
         job_id = jobs.submit("dataset", command, project_id=project_id, cwd=ROOT)
         return str(output), f"Queued dataset job: {job_id}"
+
+    def project_dataset_path(project_id):
+        if not project_id:
+            return ""
+        project = storage.get_project(project_id)
+        stored = str(project.training.get("dataset_path") or "").strip()
+        if stored:
+            return stored
+        try:
+            return str(resolve_training_dataset(project, storage))
+        except ValueError:
+            return ""
 
     def queue_training(project_id, dataset_path, device, quality, epochs):
         project = storage.get_project(project_id)
@@ -680,12 +695,21 @@ def build_app(
         try:
             checkpoint = command[command.index("--base_checkpoint") + 1]
             model_index = command.index("--model") + 1
+            data_index = command.index("--data_path") + 1
+            test_index = command.index("--test_npz_path") + 1
         except (ValueError, IndexError) as exc:
-            raise gr.Error("Training command is missing checkpoint/model arguments") from exc
+            raise gr.Error("Training command is missing checkpoint/model/dataset arguments") from exc
         variant = infer_checkpoint_model(checkpoint)
         if not variant:
             raise gr.Error("Cannot infer checkpoint architecture for retry")
         command[model_index] = variant
+        requested_dataset = Path(command[data_index]).parent
+        project = storage.get_project(job["project_id"])
+        dataset = resolve_training_dataset(project, storage, requested_dataset)
+        command[data_index] = str(dataset / "train")
+        command[test_index] = str(dataset / "test.npz")
+        project.training["dataset_path"] = str(dataset)
+        storage.save_project(project)
         resume_point = Path(job.get("resume_point") or "")
         if resume_point.is_file() and "--resume" not in command:
             command += ["--resume", str(resume_point)]
@@ -699,7 +723,10 @@ def build_app(
             resume_point=job.get("resume_point"),
         )
         storage.replace_training_job(job["project_id"], job_id, new_id)
-        return f"Retried training as {new_id} with architecture {variant}"
+        return (
+            f"Retried training as {new_id} with architecture {variant}; "
+            f"dataset {dataset}"
+        )
 
     with gr.Blocks(title=t("app_title"), theme=gr.themes.Soft()) as app:
         gr.Markdown(
@@ -985,6 +1012,7 @@ def build_app(
         )
         refresh_projects_btn.click(refresh_projects, outputs=project_selector)
         project_selector.change(project_summary, project_selector, project_json)
+        project_selector.change(project_dataset_path, project_selector, dataset_path)
         save_assets_btn.click(
             save_assets,
             [project_selector, input_mode, source_font, target_files, sc_font, tc_font, jp_font, kr_font],

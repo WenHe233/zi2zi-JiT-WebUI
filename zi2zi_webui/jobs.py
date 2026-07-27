@@ -80,6 +80,15 @@ def summarize_failure(log_path: str | Path, return_code: int) -> str:
         return "CUDA out of memory. Choose a lower-memory preset or reduce batch size."
     if "No space left on device" in text:
         return "Disk is full while writing task artifacts."
+    if "FileNotFoundError" in text and re.search(
+        r"[\\/]+train(?:['\"]|\s|$)",
+        text,
+        flags=re.IGNORECASE,
+    ):
+        return (
+            "Training dataset directory is missing. Generate or select a dataset "
+            "containing train/ and test.npz, then retry."
+        )
     exception_lines = re.findall(
         r"^(?:[A-Za-z_][\w.]*)(?:Error|Exception):\s+.+$",
         text,
@@ -259,6 +268,8 @@ class JobManager:
         environment = os.environ.copy()
         environment.update(json.loads(job["env_json"]))
         environment["PYTHONUNBUFFERED"] = "1"
+        environment["PYTHONIOENCODING"] = "utf-8"
+        environment["PYTHONUTF8"] = "1"
         if job["gpu"] not in (None, ""):
             environment["CUDA_VISIBLE_DEVICES"] = str(job["gpu"])
 
