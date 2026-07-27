@@ -4,12 +4,17 @@ import json
 from pathlib import Path
 from typing import Iterable
 
+import matplotlib
+
+matplotlib.use("Agg", force=True)
+
+from matplotlib.backends.backend_agg import FigureCanvasAgg
+from matplotlib.figure import Figure
+
 from .telemetry import read_metrics
 
 
 def training_figures(metric_paths: Iterable[str | Path]):
-    import matplotlib.pyplot as plt
-
     paths = [Path(item) for item in metric_paths if item]
     records_by_run = [(path.parent.name[:8], read_metrics(path)) for path in paths]
 
@@ -25,7 +30,9 @@ def training_figures(metric_paths: Iterable[str | Path]):
         ("Evaluation", ("ssim", "lpips", "l1", "fid"), "epoch"),
     )
     for title, keys, x_key in specs:
-        figure, axis = plt.subplots(figsize=(7.2, 3.2), constrained_layout=True)
+        figure = Figure(figsize=(7.2, 3.2), constrained_layout=True)
+        FigureCanvasAgg(figure)
+        axis = figure.subplots()
         found = False
         for run_name, records in records_by_run:
             for key in keys:

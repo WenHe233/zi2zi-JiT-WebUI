@@ -330,7 +330,11 @@ def build_app(
     def refresh_charts(project_id, run_ids):
         runs = project_runs(project_id)
         selected = [item for item in runs if item["id"] in (run_ids or [])][:5]
-        figures = training_figures([item["metrics_path"] for item in selected])
+        figures = (
+            training_figures([item["metrics_path"] for item in selected])
+            if selected
+            else (None, None, None, None)
+        )
         headers = ["parameter", *[item["id"][:8] for item in selected]]
         records = [
             (item["id"][:8], read_metrics(item["metrics_path"]))

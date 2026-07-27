@@ -3,9 +3,12 @@ from __future__ import annotations
 
 import argparse
 import atexit
+import os
 import subprocess
 import sys
 from pathlib import Path
+
+os.environ.setdefault("MPLBACKEND", "Agg")
 
 from zi2zi_webui.app import build_app
 from zi2zi_webui.jobs import JobManager
