@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import hashlib
+import re
 import shutil
 import sys
 from pathlib import Path
@@ -19,6 +20,19 @@ OFFICIAL_MODELS = {
     "JiT-B/16": "zi2zi-JiT-B-16.pth",
     "JiT-L/16": "zi2zi-JiT-L-16.pth",
 }
+
+
+def infer_checkpoint_model(path: str | Path, metadata: dict[str, Any] | None = None) -> str | None:
+    metadata = metadata or {}
+    configured = str(metadata.get("model") or "")
+    if configured in OFFICIAL_MODELS:
+        return configured
+    name = Path(path).name.lower()
+    if re.search(r"(?:jit|^)[-_]?l(?:[-_.]|$)", name):
+        return "JiT-L/16"
+    if re.search(r"(?:jit|^)[-_]?b(?:[-_.]|$)", name):
+        return "JiT-B/16"
+    return None
 
 
 def copy_project_input(
@@ -70,6 +84,11 @@ def validate_checkpoint(path: str | Path) -> dict[str, Any]:
     if not isinstance(state_dict, dict):
         raise ValueError("Checkpoint does not contain a recognizable model state")
     model = getattr(args, "model", None) if args is not None else None
+    if model not in OFFICIAL_MODELS:
+        position = state_dict.get("net.pos_embed")
+        width = int(position.shape[-1]) if hasattr(position, "shape") else 0
+        model = "JiT-L/16" if width == 1024 else "JiT-B/16" if width == 768 else None
+    model = model or infer_checkpoint_model(path)
     return {
         "path": str(Path(path).resolve()),
         "filename": Path(path).name,

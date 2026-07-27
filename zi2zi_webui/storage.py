@@ -83,6 +83,7 @@ class Storage:
                     error TEXT,
                     schema_version INTEGER NOT NULL DEFAULT 1,
                     progress REAL NOT NULL DEFAULT 0,
+                    progress_text TEXT NOT NULL DEFAULT '',
                     resume_point TEXT NOT NULL DEFAULT '',
                     created_at TEXT NOT NULL,
                     started_at TEXT,
@@ -99,6 +100,7 @@ class Storage:
             for name, definition in (
                 ("schema_version", "INTEGER NOT NULL DEFAULT 1"),
                 ("progress", "REAL NOT NULL DEFAULT 0"),
+                ("progress_text", "TEXT NOT NULL DEFAULT ''"),
                 ("resume_point", "TEXT NOT NULL DEFAULT ''"),
             ):
                 if name not in columns:
@@ -206,3 +208,31 @@ class Storage:
             raise ValueError("Invalid training run id")
         if run_dir.exists():
             shutil.rmtree(run_dir)
+
+    def replace_training_job(
+        self,
+        project_id: str,
+        old_job_id: str,
+        new_job_id: str,
+    ) -> None:
+        with self._lock, self._connect() as db:
+            rows = db.execute(
+                "SELECT id, payload_json FROM training_runs WHERE project_id=?",
+                (project_id,),
+            ).fetchall()
+            for row in rows:
+                payload = json.loads(row["payload_json"])
+                parameters = payload.get("parameters", {})
+                if parameters.get("job_id") != old_job_id:
+                    continue
+                parameters["job_id"] = new_job_id
+                payload["parameters"] = parameters
+                payload["status"] = "queued"
+                db.execute(
+                    """
+                    UPDATE training_runs
+                    SET status='queued', payload_json=?, updated_at=?
+                    WHERE id=?
+                    """,
+                    (json.dumps(payload, ensure_ascii=False), utc_now(), row["id"]),
+                )

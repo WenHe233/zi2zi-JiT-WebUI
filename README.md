@@ -105,6 +105,12 @@ usage, preview snapshots, SSIM, LPIPS, L1 and FID. It can compare up to five
 runs from the same project and export metrics as CSV/JSON plus the current
 charts as PNG.
 
+The always-visible task monitor streams logs and progress for model downloads,
+dataset builds, training, generation and font export. Failed jobs show a
+condensed reason extracted from their traceback. Official B/L checkpoint
+filenames and validated checkpoint metadata select the matching architecture
+automatically.
+
 Balanced and quality presets generate eight fixed preview glyphs every 10
 epochs and run a full evaluation every 40 epochs. The full evaluation can be
 disabled. `last`, `best-SSIM` and `best-LPIPS` checkpoints are retained when

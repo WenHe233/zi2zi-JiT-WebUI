@@ -1,4 +1,4 @@
-from zi2zi_webui.services import dataset_command
+from zi2zi_webui.services import dataset_command, infer_checkpoint_model
 from zi2zi_webui.storage import Storage
 
 
@@ -25,3 +25,8 @@ def test_dataset_command_passes_ordered_regional_and_global_source_fonts(tmp_pat
         "global-1.ttf",
         "global-2.ttf",
     ]
+
+
+def test_checkpoint_variant_is_inferred_from_official_filename():
+    assert infer_checkpoint_model("zi2zi-JiT-L-16.pth") == "JiT-L/16"
+    assert infer_checkpoint_model("zi2zi-JiT-B-16.pth") == "JiT-B/16"

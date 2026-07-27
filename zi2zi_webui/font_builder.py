@@ -8,6 +8,7 @@ import xml.etree.ElementTree as ET
 import zipfile
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from typing import Callable
 
 import cv2
 import numpy as np
@@ -150,6 +151,7 @@ def build_ttf(
     metrics_profile: str = "proportional",
     vectorize_options: VectorizeOptions | None = None,
     svg_dir: str | Path | None = None,
+    progress_callback: Callable[[int, int, int], None] | None = None,
 ) -> dict:
     if not metadata.family_name.strip():
         raise ValueError("Font family name is required")
@@ -169,7 +171,8 @@ def build_ttf(
     metrics[".notdef"] = (1000, 50)
     report = {"included": [], "failed": [], "metrics_profile": metrics_profile}
 
-    for codepoint, image_path in sorted(glyph_images.items()):
+    ordered_images = sorted(glyph_images.items())
+    for index, (codepoint, image_path) in enumerate(ordered_images, start=1):
         glyph_name = f"uni{codepoint:04X}" if codepoint <= 0xFFFF else f"u{codepoint:06X}"
         svg_path = svg_dir / f"U+{codepoint:04X}.svg"
         try:
@@ -218,6 +221,8 @@ def build_ttf(
             report["failed"].append(
                 {"codepoint": f"U+{codepoint:04X}", "error": f"{type(exc).__name__}: {exc}"}
             )
+        if progress_callback is not None:
+            progress_callback(index, len(ordered_images), codepoint)
 
     font = FontBuilder(1000, isTTF=True)
     font.setupGlyphOrder(glyph_order)

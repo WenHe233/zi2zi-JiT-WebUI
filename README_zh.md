@@ -85,6 +85,10 @@ python scripts/generate_font_dataset.py \
 比较同项目最多五次训练，并导出 CSV/JSON 与当前图表 PNG。启用完整评估后保留 `last`、
 `best-SSIM`、`best-LPIPS` checkpoint；早停默认关闭。
 
+页面顶部的常驻任务监控会实时显示模型下载、数据集、训练、生成和字体导出的日志与
+进度；任务失败时直接显示从 traceback 提炼的原因。官方 B/L checkpoint 文件名及
+已验证元数据会自动选择匹配的模型架构。
+
 checkpoint 会保存优化器、训练进度和随机数状态。在训练页选择历史 run 后点击
 “Resume selected run from last checkpoint”，会建立可追溯的子 run。旧 checkpoint
 缺少这些字段时仍可按权重恢复，并明确告警。

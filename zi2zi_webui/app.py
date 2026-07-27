@@ -31,6 +31,7 @@ from .services import (
     dataset_command,
     generation_command,
     import_model,
+    infer_checkpoint_model,
     queue_official_model_download,
     training_command,
 )
@@ -187,7 +188,8 @@ def build_app(
         project.base_model = model_path
         project.active_checkpoint = model_path
         storage.save_project(project)
-        return f"Attached shared model: {model_path}"
+        variant = infer_checkpoint_model(model_path)
+        return f"Attached shared model: {model_path}\nArchitecture: {variant or 'unknown'}"
 
     def queue_dataset(project_id, train_count, test_count, charset, workers):
         project = storage.get_project(project_id)
@@ -208,11 +210,19 @@ def build_app(
             raise gr.Error("Import or download and attach a base model first")
         metadata_path = Path(project.base_model).with_suffix(Path(project.base_model).suffix + ".json")
         overrides: dict[str, Any] = {"epochs": int(epochs)}
+        metadata: dict[str, Any] = {}
         if metadata_path.exists():
             metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
             for key in ("num_fonts", "num_chars"):
                 if metadata.get(key):
                     overrides[key] = metadata[key]
+        model_variant = infer_checkpoint_model(project.base_model, metadata)
+        if not model_variant:
+            raise gr.Error(
+                "Cannot determine whether the checkpoint is JiT-B/16 or JiT-L/16. "
+                "Re-import it to generate validated metadata."
+            )
+        overrides["model"] = model_variant
         run, command = training_command(
             project, storage, dataset_path, device, quality, overrides
         )
@@ -226,7 +236,10 @@ def build_app(
         )
         run.parameters["job_id"] = job_id
         storage.save_training_run(run)
-        return run.id, f"Queued training run {run.id}; job {job_id}"
+        return (
+            run.id,
+            f"Queued training run {run.id}; job {job_id}; architecture {model_variant}",
+        )
 
     def resume_training(project_id, run_ids, dataset_path, device, epochs):
         selected_id = (run_ids or [None])[0]
@@ -294,14 +307,24 @@ def build_app(
             job_id = item.get("parameters", {}).get("job_id")
             if job_id:
                 try:
-                    item["status"] = jobs.get_job(job_id)["status"]
+                    job = jobs.get_job(job_id)
+                    item["status"] = job["status"]
+                    item["error"] = job.get("error") or ""
+                    item["progress"] = job.get("progress") or 0
                 except KeyError:
                     pass
         return runs
 
     def run_choices(project_id):
         runs = project_runs(project_id)
-        choices = [(f"{item['id'][:8]} · {item['status']}", item["id"]) for item in runs]
+        choices = [
+            (
+                f"{item['id'][:8]} · {item['status']} · "
+                f"{float(item.get('progress', 0)) * 100:.1f}%",
+                item["id"],
+            )
+            for item in runs
+        ]
         return gr.update(choices=choices, value=[item[1] for item in choices[:1]])
 
     def refresh_charts(project_id, run_ids):
@@ -343,11 +366,18 @@ def build_app(
             if event.get("phase") == "evaluation"
             for path in Path(event.get("snapshot_path", "")).glob("*.png")
         ]
-        summary = (
-            "```\n" + latest_summary(selected[0]["metrics_path"]) + "\n```"
-            if selected
-            else "No run selected."
-        )
+        if selected and selected[0].get("error"):
+            summary = (
+                f"**{b('训练失败原因', 'Training failure reason')}：** "
+                f"{selected[0]['error']}\n\n"
+                "```\n"
+                + latest_summary(selected[0]["metrics_path"])
+                + "\n```"
+            )
+        elif selected:
+            summary = "```\n" + latest_summary(selected[0]["metrics_path"]) + "\n```"
+        else:
+            summary = "No run selected."
         return (
             *figures,
             gr.update(headers=headers, value=run_parameter_rows(selected)),
@@ -583,21 +613,89 @@ def build_app(
             )
         return [str(item) for item in artifacts], [str(item) for item in svgs[-100:]], preview
 
-    def job_table(project_id):
-        rows = jobs.list_jobs(project_id)
+    def monitor_jobs(_project_id, selected_id=None, follow_latest=True):
+        rows = jobs.list_jobs()
         table = [
             [
                 item["id"],
+                (item["project_id"] or "")[:8],
                 item["job_type"],
                 item["status"],
+                round(float(item["progress"] or 0) * 100, 1),
+                item.get("progress_text") or "",
                 item["gpu"] or "",
                 item["created_at"],
-                item["return_code"],
+                item.get("error") or "",
             ]
             for item in rows
         ]
-        choices = [(f"{item['job_type']} · {item['status']} · {item['id'][:8]}", item["id"]) for item in rows]
-        return table, gr.update(choices=choices, value=choices[0][1] if choices else None)
+        choices = [
+            (
+                f"{item['job_type']} · {item['status']} · "
+                f"{float(item['progress'] or 0) * 100:.1f}% · {item['id'][:8]}",
+                item["id"],
+            )
+            for item in rows
+        ]
+        valid_ids = {item["id"] for item in rows}
+        selected = (
+            rows[0]["id"]
+            if rows and follow_latest
+            else selected_id
+            if selected_id in valid_ids
+            else rows[0]["id"]
+            if rows
+            else None
+        )
+        if not selected:
+            return table, gr.update(choices=[], value=None), 0, "No tasks.", ""
+        job = next(item for item in rows if item["id"] == selected)
+        reason = job.get("error") or ""
+        status = (
+            f"**{job['job_type']} · {job['status']}**  \n"
+            f"`{job['id']}`  \n"
+            f"{job.get('progress_text') or ''}"
+        )
+        if reason:
+            status += f"\n\n**{b('失败原因', 'Failure reason')}：** {reason}"
+        return (
+            table,
+            gr.update(choices=choices, value=selected),
+            round(float(job["progress"] or 0) * 100, 1),
+            status,
+            jobs.read_log(selected),
+        )
+
+    def retry_selected_job(job_id):
+        job = jobs.get_job(job_id)
+        if job["status"] not in {"failed", "cancelled", "interrupted"}:
+            raise gr.Error("Only failed, cancelled, or interrupted jobs can be retried")
+        if job["job_type"] != "training":
+            return f"Retried as: {jobs.retry(job_id)}"
+        command = json.loads(job["command_json"])
+        try:
+            checkpoint = command[command.index("--base_checkpoint") + 1]
+            model_index = command.index("--model") + 1
+        except (ValueError, IndexError) as exc:
+            raise gr.Error("Training command is missing checkpoint/model arguments") from exc
+        variant = infer_checkpoint_model(checkpoint)
+        if not variant:
+            raise gr.Error("Cannot infer checkpoint architecture for retry")
+        command[model_index] = variant
+        resume_point = Path(job.get("resume_point") or "")
+        if resume_point.is_file() and "--resume" not in command:
+            command += ["--resume", str(resume_point)]
+        new_id = jobs.submit(
+            "training",
+            command,
+            project_id=job["project_id"],
+            cwd=job["cwd"],
+            gpu=job["gpu"],
+            env=json.loads(job["env_json"]),
+            resume_point=job.get("resume_point"),
+        )
+        storage.replace_training_job(job["project_id"], job_id, new_id)
+        return f"Retried training as {new_id} with architecture {variant}"
 
     with gr.Blocks(title=t("app_title"), theme=gr.themes.Soft()) as app:
         gr.Markdown(
@@ -618,6 +716,42 @@ def build_app(
                 scale=1,
             )
         project_json = gr.Code(label=b("项目清单", "Project manifest"), language="json", lines=8)
+        with gr.Accordion(b("实时任务监控", "Live task monitor"), open=True):
+            jobs_table = gr.Dataframe(
+                headers=[
+                    "id",
+                    "project",
+                    "type",
+                    "status",
+                    "progress %",
+                    "activity",
+                    "gpu",
+                    "created",
+                    "error",
+                ],
+                interactive=False,
+            )
+            with gr.Row():
+                job_selector = gr.Dropdown(label=b("当前任务", "Current task"), scale=5)
+                follow_latest_job = gr.Checkbox(
+                    value=True,
+                    label=b("自动跟随最新任务", "Follow latest task"),
+                    scale=1,
+                )
+            job_progress = gr.Slider(
+                minimum=0,
+                maximum=100,
+                value=0,
+                interactive=False,
+                label=b("进度（%）", "Progress (%)"),
+            )
+            job_monitor_status = gr.Markdown()
+            job_log = gr.Textbox(
+                label=b("实时日志", "Live log"),
+                lines=16,
+                max_lines=32,
+                autoscroll=True,
+            )
 
         with gr.Tab(t("projects")):
             with gr.Row():
@@ -836,16 +970,10 @@ def build_app(
 
         with gr.Tab(t("advanced")):
             refresh_jobs_btn = gr.Button(b("刷新任务", "Refresh jobs"))
-            jobs_table = gr.Dataframe(
-                headers=["id", "type", "status", "gpu", "created", "return_code"],
-                interactive=False,
-            )
-            job_selector = gr.Dropdown(label=b("任务", "Job"))
             with gr.Row():
                 refresh_log_btn = gr.Button(b("刷新日志", "Refresh log"))
                 cancel_job_btn = gr.Button(b("取消", "Cancel"))
                 retry_job_btn = gr.Button(b("重试", "Retry"))
-            job_log = gr.Textbox(label=b("日志", "Log"), lines=24, max_lines=40)
             job_action_status = gr.Markdown()
 
         create_project_btn.click(
@@ -975,16 +1103,37 @@ def build_app(
             [font_artifacts, svg_gallery, final_font_preview],
         )
         refresh_jobs_btn.click(
-            job_table, project_selector, [jobs_table, job_selector]
+            monitor_jobs,
+            [project_selector, job_selector, follow_latest_job],
+            [jobs_table, job_selector, job_progress, job_monitor_status, job_log],
         )
-        refresh_log_btn.click(jobs.read_log, job_selector, job_log)
+        refresh_log_btn.click(
+            monitor_jobs,
+            [project_selector, job_selector, follow_latest_job],
+            [jobs_table, job_selector, job_progress, job_monitor_status, job_log],
+        )
+        job_selection = job_selector.input(
+            lambda: False,
+            outputs=follow_latest_job,
+        )
+        job_selection.then(
+            monitor_jobs,
+            [project_selector, job_selector, follow_latest_job],
+            [jobs_table, job_selector, job_progress, job_monitor_status, job_log],
+        )
+        job_timer = gr.Timer(1)
+        job_timer.tick(
+            monitor_jobs,
+            [project_selector, job_selector, follow_latest_job],
+            [jobs_table, job_selector, job_progress, job_monitor_status, job_log],
+        )
         cancel_job_btn.click(
             lambda job_id: f"Cancelled: {jobs.cancel(job_id)}",
             job_selector,
             job_action_status,
         )
         retry_job_btn.click(
-            lambda job_id: f"Retried as: {jobs.retry(job_id)}",
+            retry_selected_job,
             job_selector,
             job_action_status,
         )

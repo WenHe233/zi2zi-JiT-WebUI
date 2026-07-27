@@ -54,6 +54,17 @@ def main() -> None:
             threshold=args.threshold,
             despeckle_area=args.despeckle_area,
         ),
+        progress_callback=lambda current, total, codepoint: print(
+            "WEBUI_PROGRESS "
+            + json.dumps(
+                {
+                    "current": current,
+                    "total": total,
+                    "message": f"Vectorizing U+{codepoint:04X} ({current}/{total})",
+                }
+            ),
+            flush=True,
+        ),
     )
     archive = build_export_package(
         args.output,

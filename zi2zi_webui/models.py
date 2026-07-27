@@ -109,6 +109,7 @@ class JobRecord:
     gpu: str | None = None
     log_path: str = ""
     progress: float = 0.0
+    progress_text: str = ""
     resume_point: str = ""
     created_at: str = field(default_factory=utc_now)
 
