@@ -5,6 +5,9 @@ import time
 from collections import defaultdict, deque
 from pathlib import Path
 import copy
+import random
+
+import numpy as np
 
 import torch
 import torch.distributed as dist
@@ -289,7 +292,14 @@ def all_reduce_mean(x):
         return x
 
 
-def save_model_no_ema(args, model_without_ddp, epoch, epoch_name=None):
+def save_model_no_ema(
+    args,
+    model_without_ddp,
+    epoch,
+    epoch_name=None,
+    optimizer=None,
+    training_state=None,
+):
     if epoch_name is None:
         epoch_name = str(epoch)
     output_dir = Path(args.output_dir)
@@ -298,5 +308,15 @@ def save_model_no_ema(args, model_without_ddp, epoch, epoch_name=None):
         'model': model_without_ddp.state_dict(),
         'epoch': epoch,
         'args': args,
+        'rng_state': {
+            'python': random.getstate(),
+            'numpy': np.random.get_state(),
+            'torch': torch.get_rng_state(),
+            'cuda': torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+        },
     }
+    if optimizer is not None:
+        to_save['optimizer'] = optimizer.state_dict()
+    if training_state is not None:
+        to_save['training_state'] = training_state
     save_on_master(to_save, checkpoint_path)

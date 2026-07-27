@@ -41,6 +41,92 @@ Generated glyphs are evaluated against ground-truth references following the pro
 
 ## How To Use
 
+### WebUI
+
+The project includes a local, project-based Gradio UI for dataset creation,
+LoRA fine-tuning, live training charts, reproducible generation, glyph review,
+SVG tracing and TrueType font export.
+
+```bash
+conda env create -f environment.yaml
+conda activate zi2zi-jit
+pip install -e .
+python webui.py
+```
+
+Open <http://127.0.0.1:7860>. TensorBoard is started at
+<http://127.0.0.1:6006>. Project state, models and generated artifacts live in
+the git-ignored `webui_data/` directory by default.
+
+Windows and Linux launchers are also provided:
+
+```bash
+# Windows
+start_webui.bat
+
+# Linux
+./start_webui.sh
+```
+
+For NVIDIA Docker:
+
+```bash
+docker compose up --build
+```
+
+The complete training workflow requires an NVIDIA CUDA GPU. CPU and Apple MPS
+remain available for inference only. The WebUI binds to localhost by default
+and has no multi-user authentication; do not expose it to an untrusted
+network.
+
+#### Training dashboard
+
+Each run records TensorBoard events and an append-only `metrics.jsonl`. The
+dashboard shows loss/EMA, learning rate, throughput, ETA, GPU/CPU/RAM/disk
+usage, preview snapshots, SSIM, LPIPS, L1 and FID. It can compare up to five
+runs from the same project and export metrics as CSV/JSON plus the current
+charts as PNG.
+
+Balanced and quality presets generate eight fixed preview glyphs every 10
+epochs and run a full evaluation every 40 epochs. The full evaluation can be
+disabled. `last`, `best-SSIM` and `best-LPIPS` checkpoints are retained when
+the required metrics are available. Optional early stopping is disabled by
+default.
+
+Training checkpoints contain optimizer, progress and random-number-generator
+state. Select a previous run and use **Resume selected run from last
+checkpoint** to create a traceable child run. Older checkpoints without these
+fields remain loadable as weight-only resumes and produce a warning.
+
+PyTorch checkpoint files can execute code while loading. The model import
+screen therefore requires an explicit trust confirmation and validates the
+state dictionary and architecture metadata after loading. Only import models
+from sources you trust.
+
+#### TTF export
+
+Generated PNGs can be traced to editable SVGs and packaged as an unhinted
+TrueType draft. The exporter offers proportional Latin metrics or a 2:1
+CJK/Latin monospace profile, reports failed glyphs, and never copies source
+font outlines as a fallback. It also creates a ZIP containing the TTF,
+selected PNGs, editable SVGs, glyph/seed manifests, training and font-quality
+reports, and a README. Review these artifacts before publishing a font.
+
+See [character preset design](docs/charset-presets.md) for preset provenance
+and regional-font behavior.
+
+#### Troubleshooting
+
+- If the UI cannot start, recreate the Conda environment; Gradio 5.21 is
+  paired with `pydantic<2.11` in `environment.yaml`.
+- If TensorBoard port 6006 is occupied, pass `--tensorboard-port <port>` or
+  `--no-tensorboard`.
+- A disabled training button/device means no NVIDIA CUDA device was detected;
+  CPU and MPS remain valid for inference.
+- Jobs and their logs survive page refreshes. After an application restart,
+  an in-flight job is marked `interrupted` and can be retried; use the
+  checkpoint resume action for training.
+
 ### Environment Setup
 
 ```bash

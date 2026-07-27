@@ -1,0 +1,16 @@
+services:
+  webui:
+    build: .
+    ports:
+      - "127.0.0.1:7860:7860"
+      - "127.0.0.1:6006:6006"
+    volumes:
+      - ./webui_data:/data
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    restart: unless-stopped

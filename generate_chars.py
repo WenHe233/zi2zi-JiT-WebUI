@@ -62,6 +62,10 @@ def get_args_parser():
     # Generation parameters
     parser.add_argument('--num_images', type=int, default=None,
                         help='Number of images to generate (default: all)')
+    parser.add_argument('--seed', type=int, default=42,
+                        help='Base random seed for reproducible generation (default: 42)')
+    parser.add_argument('--num_candidates', type=int, default=1,
+                        help='Candidates per input glyph (1-8, default: 1)')
     parser.add_argument('--batch_size', type=int, default=64,
                         help='Per-GPU batch size for generation')
     parser.add_argument('--cfg', type=float, default=None,
@@ -158,6 +162,12 @@ def patch_torch_for_device(device):
 def main(args):
     device = resolve_device(args.device)
     use_cuda_amp = device.type == 'cuda'
+    if not 1 <= args.num_candidates <= 8:
+        raise ValueError('--num_candidates must be between 1 and 8')
+    torch.manual_seed(args.seed)
+    np.random.seed(args.seed)
+    if device.type == 'cuda':
+        torch.cuda.manual_seed_all(args.seed)
 
     if device.type == 'cuda':
         misc.init_distributed_mode(args)
@@ -287,6 +297,23 @@ def main(args):
     else:
         print("unicode_labels not found in npz, using index-based filenames")
 
+    candidate_ids_all = np.zeros(len(font_labels_all), dtype=np.int64)
+    if args.num_candidates > 1:
+        original_count = len(font_labels_all)
+        font_labels_all = np.repeat(font_labels_all, args.num_candidates, axis=0)
+        char_labels_all = np.repeat(char_labels_all, args.num_candidates, axis=0)
+        style_images_all = np.repeat(style_images_all, args.num_candidates, axis=0)
+        content_images_all = np.repeat(content_images_all, args.num_candidates, axis=0)
+        if target_images_all is not None:
+            target_images_all = np.repeat(target_images_all, args.num_candidates, axis=0)
+        if unicode_labels_all is not None:
+            unicode_labels_all = np.repeat(unicode_labels_all, args.num_candidates, axis=0)
+        candidate_ids_all = np.tile(np.arange(args.num_candidates, dtype=np.int64), original_count)
+        print(
+            f"Expanded {original_count} inputs to {len(font_labels_all)} "
+            f"samples ({args.num_candidates} candidates each, base seed={args.seed})"
+        )
+
     num_total_samples = len(font_labels_all)
     num_images = args.num_images if args.num_images else num_total_samples
     num_images = min(num_images, num_total_samples)
@@ -305,6 +332,9 @@ def main(args):
             target_images_all = np.concatenate([target_images_all, np.repeat(target_images_all[-1:], pad_size, axis=0)])
         if unicode_labels_all is not None:
             unicode_labels_all = np.concatenate([unicode_labels_all, np.repeat(unicode_labels_all[-1:], pad_size, axis=0)])
+        candidate_ids_all = np.concatenate(
+            [candidate_ids_all, np.repeat(candidate_ids_all[-1:], pad_size, axis=0)]
+        )
 
     num_steps = padded_num_images // (batch_size * world_size)
 
@@ -392,6 +422,8 @@ def main(args):
                 filename = f"{font_id:04d}_U+{int(unicode_labels_all[img_id]):04X}"
             else:
                 filename = f"{font_id:04d}_{img_id:05d}"
+            if args.num_candidates > 1:
+                filename += f"_c{int(candidate_ids_all[img_id]):02d}_s{args.seed}"
 
             # Convert to uint8 BGR for OpenCV
             gen_img = np.round(np.clip(generated[b_id].numpy().transpose([1, 2, 0]) * 255, 0, 255))

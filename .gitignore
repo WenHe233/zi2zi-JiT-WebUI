@@ -8,6 +8,7 @@ build/
 dist/
 *.egg-info/
 .eggs/
+src/
 
 # Virtual environments
 .venv/
@@ -52,3 +53,6 @@ events.out.tfevents.*
 # Temp files
 tmp/
 temp/
+
+# Local WebUI state, models, projects, logs and generated fonts
+webui_data/

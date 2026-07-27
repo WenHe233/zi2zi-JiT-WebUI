@@ -1,6 +1,7 @@
 import argparse
 import datetime
 import os
+import random
 import time
 from pathlib import Path
 
@@ -23,6 +24,7 @@ from main_jit import FontSrcTargetRefsDataset, collate_src_target_refs
 from util.crop import resize_and_random_crop
 from util.misc import save_model_no_ema
 import util.misc as misc
+from zi2zi_webui.telemetry import MetricsWriter, write_training_report
 
 
 # ---------------------------------------------------------------------------
@@ -90,6 +92,19 @@ def get_args_parser():
     parser.add_argument('--save_last_freq', type=int, default=5)
     parser.add_argument('--log_freq', default=100, type=int)
     parser.add_argument('--device', default='cuda')
+    parser.add_argument('--metrics_jsonl', default='', type=str,
+                        help='Append structured training events to this JSONL file')
+    parser.add_argument('--run_id', default='', type=str,
+                        help='Stable WebUI training run id')
+    parser.add_argument('--snapshot_freq', default=10, type=int,
+                        help='Generate a fixed 8-glyph preview every N epochs (0 disables)')
+    parser.add_argument('--early_stop', action='store_true',
+                        help='Enable evaluation-metric early stopping')
+    parser.add_argument('--early_stop_metric', default='ssim',
+                        choices=['ssim', 'lpips', 'fid'])
+    parser.add_argument('--early_stop_start', default=40, type=int)
+    parser.add_argument('--early_stop_patience', default=4, type=int)
+    parser.add_argument('--early_stop_min_delta', default=0.001, type=float)
 
     # LoRA
     parser.add_argument('--base_checkpoint', default='', type=str)
@@ -120,6 +135,7 @@ def main(args):
         log_writer = SummaryWriter(log_dir=args.output_dir)
     else:
         log_writer = None
+    metrics_writer = MetricsWriter(args.metrics_jsonl, args.run_id) if args.metrics_jsonl else None
 
     transform_train = transforms.Compose([
         transforms.Lambda(lambda img: resize_and_random_crop(img, args.img_size)),
@@ -202,11 +218,31 @@ def main(args):
     print(optimizer)
 
     checkpoint_path = resolve_checkpoint_path(args.resume) if args.resume else None
+    training_state = {
+        "best_ssim": float("-inf"),
+        "best_lpips": float("inf"),
+        "best_fid": float("inf"),
+        "early_stop_bad_evals": 0,
+    }
     if checkpoint_path and os.path.exists(checkpoint_path):
         checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
         model.load_state_dict(checkpoint["model"])
+        if "optimizer" in checkpoint:
+            optimizer.load_state_dict(checkpoint["optimizer"])
+            print("Restored optimizer state.")
+        else:
+            print("Warning: checkpoint has no optimizer state; using a warm weight-only resume.")
         if "epoch" in checkpoint:
             args.start_epoch = checkpoint["epoch"] + 1
+        training_state.update(checkpoint.get("training_state", {}))
+        rng_state = checkpoint.get("rng_state")
+        if rng_state:
+            random.setstate(rng_state["python"])
+            np.random.set_state(rng_state["numpy"])
+            torch.set_rng_state(rng_state["torch"])
+            if torch.cuda.is_available() and rng_state.get("cuda"):
+                torch.cuda.set_rng_state_all(rng_state["cuda"])
+            print("Restored random number generator state.")
         print("Resumed LoRA checkpoint from", checkpoint_path)
         del checkpoint
     elif args.resume:
@@ -219,35 +255,136 @@ def main(args):
         with torch.random.fork_rng():
             torch.manual_seed(args.seed)
             with torch.no_grad():
-                evaluate_single_gpu(model, args, 0, batch_size=args.gen_bsz, log_writer=log_writer)
+                evaluate_single_gpu(
+                    model, args, 0, batch_size=args.gen_bsz,
+                    log_writer=log_writer, metrics_writer=metrics_writer
+                )
         return
 
     print(f"Start LoRA training for {args.epochs} epochs")
     start_time = time.time()
+    should_stop = False
     for epoch in range(args.start_epoch, args.epochs):
         train_one_epoch_single_gpu(model, data_loader_train, optimizer, device, epoch,
-                                   log_writer=log_writer, args=args)
+                                   log_writer=log_writer, args=args,
+                                   metrics_writer=metrics_writer, run_start_time=start_time)
 
         if epoch > 0 and (epoch % args.save_last_freq == 0 or epoch + 1 == args.epochs):
             save_model_no_ema(
                 args=args,
                 model_without_ddp=model,
                 epoch=epoch,
-                epoch_name="last"
+                epoch_name="last",
+                optimizer=optimizer,
+                training_state=training_state,
             )
+            if metrics_writer is not None:
+                metrics_writer.write({
+                    "phase": "checkpoint",
+                    "epoch": epoch,
+                    "kind": "last",
+                    "path": str(Path(args.output_dir) / "checkpoint-last.pth"),
+                })
+
+        if args.snapshot_freq > 0 and epoch > 0 and (
+            epoch % args.snapshot_freq == 0 or epoch + 1 == args.epochs
+        ):
+            original_num_images = args.num_images
+            args.num_images = min(8, original_num_images)
+            with torch.random.fork_rng():
+                torch.manual_seed(args.seed)
+                with torch.no_grad():
+                    evaluate_single_gpu(
+                        model, args, epoch, batch_size=min(args.gen_bsz, 8),
+                        log_writer=None, metrics_writer=metrics_writer,
+                        compute_full_metrics=False,
+                    )
+            args.num_images = original_num_images
 
         if args.online_eval and epoch > 0 and (epoch % args.eval_freq == 0 or epoch + 1 == args.epochs):
             torch.cuda.empty_cache()
             with torch.no_grad():
-                evaluate_single_gpu(model, args, epoch, batch_size=args.gen_bsz, log_writer=log_writer)
+                results = evaluate_single_gpu(
+                    model, args, epoch, batch_size=args.gen_bsz,
+                    log_writer=log_writer, metrics_writer=metrics_writer
+                )
             torch.cuda.empty_cache()
+            early_previous = training_state[f"best_{args.early_stop_metric}"]
+            if results["ssim"] > training_state["best_ssim"]:
+                training_state["best_ssim"] = results["ssim"]
+                save_model_no_ema(
+                    args, model, epoch, "best-ssim", optimizer, training_state
+                )
+                if metrics_writer is not None:
+                    metrics_writer.write({
+                        "phase": "checkpoint",
+                        "epoch": epoch,
+                        "kind": "best-ssim",
+                        "metric": results["ssim"],
+                        "path": str(Path(args.output_dir) / "checkpoint-best-ssim.pth"),
+                    })
+            if results["lpips"] < training_state["best_lpips"]:
+                training_state["best_lpips"] = results["lpips"]
+                save_model_no_ema(
+                    args, model, epoch, "best-lpips", optimizer, training_state
+                )
+                if metrics_writer is not None:
+                    metrics_writer.write({
+                        "phase": "checkpoint",
+                        "epoch": epoch,
+                        "kind": "best-lpips",
+                        "metric": results["lpips"],
+                        "path": str(Path(args.output_dir) / "checkpoint-best-lpips.pth"),
+                    })
+            if results["fid"] < training_state["best_fid"]:
+                training_state["best_fid"] = results["fid"]
+
+            if args.early_stop and epoch >= args.early_stop_start:
+                metric = args.early_stop_metric
+                current = results[metric]
+                best_key = f"best_{metric}"
+                improved = (
+                    current > early_previous + args.early_stop_min_delta
+                    if metric == "ssim"
+                    else current < early_previous - args.early_stop_min_delta
+                )
+                if improved:
+                    training_state[best_key] = current
+                    training_state["early_stop_bad_evals"] = 0
+                else:
+                    training_state["early_stop_bad_evals"] += 1
+                if training_state["early_stop_bad_evals"] >= args.early_stop_patience:
+                    print(
+                        f"Early stopping: {metric} did not improve for "
+                        f"{args.early_stop_patience} evaluations."
+                    )
+                    if metrics_writer is not None:
+                        metrics_writer.write({
+                            "phase": "early_stop",
+                            "epoch": epoch,
+                            "metric": metric,
+                            "value": current,
+                        })
+                    should_stop = True
 
         if log_writer is not None:
             log_writer.flush()
+        if should_stop:
+            break
 
     total_time = time.time() - start_time
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
     print("Training time:", total_time_str)
+    if metrics_writer is not None:
+        metrics_writer.write({
+            "phase": "training_end",
+            "elapsed_seconds": total_time,
+            "stopped_early": should_stop,
+        })
+        write_training_report(
+            args.metrics_jsonl,
+            Path(args.output_dir) / "training-report.html",
+        )
 
 
 if __name__ == "__main__":

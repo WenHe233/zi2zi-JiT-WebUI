@@ -37,6 +37,61 @@ zi2zi-JiT 是 [JiT](https://arxiv.org/abs/2511.13720)（Just image Transformer�
 
 ## 使用方法
 
+### WebUI
+
+项目提供本地、项目制的 Gradio 界面，覆盖数据集生成、LoRA 微调、实时训练图表、
+可复现推理、字形审校、SVG 描摹和 TrueType 字体导出。
+
+```bash
+conda env create -f environment.yaml
+conda activate zi2zi-jit
+pip install -e .
+python webui.py
+```
+
+浏览器打开 <http://127.0.0.1:7860>；TensorBoard 默认位于
+<http://127.0.0.1:6006>。模型、项目与生成产物默认保存在已被 Git 忽略的
+`webui_data/`。
+
+也可以运行 `start_webui.bat`（Windows）、`./start_webui.sh`（Linux），或使用
+NVIDIA Docker：
+
+```bash
+docker compose up --build
+```
+
+完整训练流程要求 NVIDIA CUDA GPU；CPU 与 Apple MPS 仅支持推理。WebUI 默认只
+监听本机且没有多用户鉴权，请勿直接暴露到不可信网络。
+
+训练仪表盘同时记录 TensorBoard 和 `metrics.jsonl`，显示 loss/EMA、学习率、
+吞吐、ETA、GPU/CPU/RAM/磁盘、固定字形快照及 SSIM、LPIPS、L1、FID。可叠加
+比较同项目最多五次训练，并导出 CSV/JSON 与当前图表 PNG。启用完整评估后保留 `last`、
+`best-SSIM`、`best-LPIPS` checkpoint；早停默认关闭。
+
+checkpoint 会保存优化器、训练进度和随机数状态。在训练页选择历史 run 后点击
+“Resume selected run from last checkpoint”，会建立可追溯的子 run。旧 checkpoint
+缺少这些字段时仍可按权重恢复，并明确告警。
+
+PyTorch checkpoint 在加载时可能执行代码，因此本地模型导入必须显式确认信任；
+载入后还会校验 state dict、架构和元数据。请勿导入来源不可信的模型。
+
+TTF 导出会保留 PNG、可编辑 SVG 和质量报告，并提供正文比例字宽与 2:1 中西文
+等宽两种指标配置。它定位为可继续精修的无 hinting 初稿，不会从源字体复制轮廓
+来填补缺字。每次构建还会生成包含 TTF、PNG、SVG、字符/seed 清单、训练报告、
+字体质量报告和 README 的 ZIP 交付包。
+
+字符集来源、地区拆分和字形上限参见
+[字符预设设计](docs/charset-presets.md)。
+
+#### 故障排查
+
+- UI 无法启动时请重建 Conda 环境；`environment.yaml` 已将 Gradio 5.21 与
+  `pydantic<2.11` 配套固定。
+- 6006 端口冲突时使用 `--tensorboard-port <端口>`，或传入 `--no-tensorboard`。
+- 没有检测到 NVIDIA CUDA 时训练不可用，但 CPU/MPS 仍可推理。
+- 刷新页面不会中断任务；应用重启后，执行中的任务会标记为 `interrupted`，普通任务
+  可重试，训练则使用 checkpoint 续训按钮。
+
 ### 环境配置
 
 ```bash

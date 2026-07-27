@@ -10,6 +10,9 @@ import util.misc as misc
 import util.lr_sched as lr_sched
 import torch_fidelity
 import copy
+import time
+
+from zi2zi_webui.telemetry import resource_snapshot
 
 
 def _resolve_fid_statistics_file(img_size):
@@ -226,7 +229,17 @@ def evaluate(model_without_ddp, args, epoch, batch_size=64, log_writer=None):
     torch.distributed.barrier()
 
 
-def train_one_epoch_single_gpu(model, data_loader, optimizer, device, epoch, log_writer=None, args=None):
+def train_one_epoch_single_gpu(
+    model,
+    data_loader,
+    optimizer,
+    device,
+    epoch,
+    log_writer=None,
+    args=None,
+    metrics_writer=None,
+    run_start_time=None,
+):
     model.train(True)
     metric_logger = misc.MetricLogger(delimiter="  ")
     metric_logger.add_meter('lr', misc.SmoothedValue(window_size=1, fmt='{value:.6f}'))
@@ -234,11 +247,15 @@ def train_one_epoch_single_gpu(model, data_loader, optimizer, device, epoch, log
     print_freq = 20
 
     optimizer.zero_grad()
+    epoch_started = time.time()
+    iteration_started = epoch_started
+    data_wait_started = epoch_started
 
     if log_writer is not None:
         print('log_dir: {}'.format(log_writer.log_dir))
 
     for data_iter_step, (x, labels) in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
+        data_load_seconds = time.time() - data_wait_started
         lr_sched.adjust_learning_rate(optimizer, data_iter_step / len(data_loader) + epoch, args)
 
         x = x.to(device, non_blocking=True).to(torch.float32).div_(255)
@@ -263,6 +280,14 @@ def train_one_epoch_single_gpu(model, data_loader, optimizer, device, epoch, log
 
         loss_value = loss.item()
         if not math.isfinite(loss_value):
+            if metrics_writer is not None:
+                metrics_writer.write({
+                    'phase': 'fatal',
+                    'epoch': epoch,
+                    'step': data_iter_step,
+                    'error': 'non_finite_loss',
+                    'loss': loss_value,
+                })
             print("Loss is {}, stopping training".format(loss_value))
             sys.exit(1)
 
@@ -281,9 +306,50 @@ def train_one_epoch_single_gpu(model, data_loader, optimizer, device, epoch, log
             if data_iter_step % args.log_freq == 0:
                 log_writer.add_scalar('train_loss', loss_value, epoch_1000x)
                 log_writer.add_scalar('lr', lr, epoch_1000x)
+        if metrics_writer is not None and data_iter_step % args.log_freq == 0:
+            now = time.time()
+            iteration_seconds = max(now - iteration_started, 1e-9)
+            completed_steps = epoch * len(data_loader) + data_iter_step + 1
+            total_steps = args.epochs * len(data_loader)
+            elapsed = now - (run_start_time or epoch_started)
+            eta_seconds = elapsed / max(completed_steps, 1) * max(total_steps - completed_steps, 0)
+            event = {
+                'phase': 'train',
+                'epoch': epoch,
+                'step': data_iter_step,
+                'global_step': completed_steps,
+                'steps_per_epoch': len(data_loader),
+                'loss': loss_value,
+                'lr': lr,
+                'iterations_per_second': max(args.log_freq, 1) / iteration_seconds,
+                'data_load_seconds': data_load_seconds,
+                'elapsed_seconds': elapsed,
+                'eta_seconds': eta_seconds,
+            }
+            event.update(resource_snapshot(device.index, args.output_dir))
+            metrics_writer.write(event)
+            iteration_started = now
+        data_wait_started = time.time()
+
+    if metrics_writer is not None:
+        metrics_writer.write(
+            {
+                'phase': 'epoch_end',
+                'epoch': epoch,
+                'epoch_seconds': time.time() - epoch_started,
+            }
+        )
 
 
-def evaluate_single_gpu(model, args, epoch, batch_size=64, log_writer=None):
+def evaluate_single_gpu(
+    model,
+    args,
+    epoch,
+    batch_size=64,
+    log_writer=None,
+    metrics_writer=None,
+    compute_full_metrics=True,
+):
     model.eval()
 
     test_data = np.load(args.test_npz_path)
@@ -374,22 +440,34 @@ def evaluate_single_gpu(model, args, epoch, batch_size=64, log_writer=None):
             grid_img = np.concatenate(rows, axis=0)
             cv2.imwrite(os.path.join(save_folder, 'grid_{}.png'.format(str(grid_id).zfill(5))), grid_img)
 
-    if log_writer is not None:
-        fid_statistics_file = _resolve_fid_statistics_file(args.img_size)
-        metrics_dict = torch_fidelity.calculate_metrics(
+    results = {'snapshot_path': save_folder, 'num_images': num_images}
+    if compute_full_metrics:
+        from scripts.compute_pairwise_metrics import compute_grid_metrics
+
+        pairwise = compute_grid_metrics(save_folder, device='cuda', batch_size=batch_size)
+        legacy = torch_fidelity.calculate_metrics(
             input1=gen_folder,
             input2=None,
-            fid_statistics_file=fid_statistics_file,
             cuda=True,
             isc=True,
-            fid=True,
+            fid=False,
             kid=False,
             prc=False,
             verbose=False,
         )
-        fid = metrics_dict['frechet_inception_distance']
-        inception_score = metrics_dict['inception_score_mean']
+        results.update(pairwise)
+        results['inception_score'] = legacy['inception_score_mean']
         postfix = "_cfg{}_res{}".format(model.cfg_scale, args.img_size)
-        log_writer.add_scalar('fid{}'.format(postfix), fid, epoch)
-        log_writer.add_scalar('is{}'.format(postfix), inception_score, epoch)
-        print("FID: {:.4f}, Inception Score: {:.4f}".format(fid, inception_score))
+        if log_writer is not None:
+            for key in ('ssim', 'lpips', 'l1', 'fid'):
+                log_writer.add_scalar('{}{}'.format(key, postfix), results[key], epoch)
+            log_writer.add_scalar('is{}'.format(postfix), results['inception_score'], epoch)
+        print(
+            "SSIM: {:.4f}, LPIPS: {:.4f}, L1: {:.4f}, FID: {:.4f}, IS: {:.4f}".format(
+                results['ssim'], results['lpips'], results['l1'],
+                results['fid'], results['inception_score']
+            )
+        )
+    if metrics_writer is not None:
+        metrics_writer.write({'phase': 'evaluation', 'epoch': epoch, **results})
+    return results
