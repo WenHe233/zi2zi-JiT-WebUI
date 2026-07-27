@@ -763,7 +763,11 @@ def build_app(
                 interactive=False,
             )
             with gr.Row():
-                job_selector = gr.Dropdown(label=b("当前任务", "Current task"), scale=5)
+                job_selector = gr.Dropdown(
+                    label=b("当前任务", "Current task"),
+                    allow_custom_value=True,
+                    scale=5,
+                )
                 follow_latest_job = gr.Checkbox(
                     value=True,
                     label=b("自动跟随最新任务", "Follow latest task"),
@@ -878,7 +882,10 @@ def build_app(
             training_run_id = gr.Textbox(label="Run ID")
             training_status = gr.Markdown()
             run_selector = gr.Dropdown(
-                label=b("对比 run（2–5 个）", "Compare runs (2–5)"), multiselect=True, max_choices=5
+                label=b("对比 run（2–5 个）", "Compare runs (2–5)"),
+                multiselect=True,
+                allow_custom_value=True,
+                max_choices=5,
             )
             with gr.Row():
                 refresh_runs_btn = gr.Button(b("刷新 run", "Refresh runs"))
@@ -1013,6 +1020,7 @@ def build_app(
         refresh_projects_btn.click(refresh_projects, outputs=project_selector)
         project_selector.change(project_summary, project_selector, project_json)
         project_selector.change(project_dataset_path, project_selector, dataset_path)
+        project_selector.change(run_choices, project_selector, run_selector)
         save_assets_btn.click(
             save_assets,
             [project_selector, input_mode, source_font, target_files, sc_font, tc_font, jp_font, kr_font],
