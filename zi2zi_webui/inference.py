@@ -8,7 +8,12 @@ from typing import Iterable
 import numpy as np
 from PIL import Image
 
-from data_processing.font_utils import GlyphRenderer, get_cjk_codepoints, load_font
+from data_processing.font_utils import (
+    GlyphRenderer,
+    GlyphRendererPool,
+    get_cjk_codepoints,
+    load_font,
+)
 
 
 def _style_image(path: str | Path, size: int = 128) -> np.ndarray:
@@ -30,7 +35,7 @@ def select_reference(reference_paths: list[str], codepoint: int, seed: int) -> s
 
 def build_inference_npz(
     codepoints: Iterable[int],
-    source_font: str | Path,
+    source_fonts: str | Path | Iterable[str | Path],
     reference_paths: list[str],
     output_path: str | Path,
     *,
@@ -40,14 +45,16 @@ def build_inference_npz(
     codepoints = list(dict.fromkeys(int(value) for value in codepoints))
     if not codepoints:
         raise ValueError("No characters were selected")
-    _, validated_font = load_font(str(source_font))
-    renderer = GlyphRenderer(str(validated_font), resolution)
+    if isinstance(source_fonts, (str, Path)):
+        source_fonts = [source_fonts]
+    renderer = GlyphRendererPool(source_fonts, resolution)
 
     valid: list[int] = []
     missing: list[int] = []
     contents: list[np.ndarray] = []
     styles: list[np.ndarray] = []
     references: list[str] = []
+    selected_sources: list[str] = []
     for codepoint in codepoints:
         content = renderer.render(codepoint)
         if content is None or codepoint not in renderer._cmap:
@@ -56,6 +63,7 @@ def build_inference_npz(
         reference = select_reference(reference_paths, codepoint, seed)
         valid.append(codepoint)
         references.append(reference)
+        selected_sources.append(str(renderer.source_for(codepoint)))
         contents.append(np.asarray(content, dtype=np.uint8).transpose(2, 0, 1))
         styles.append(_style_image(reference))
     if not valid:
@@ -75,14 +83,18 @@ def build_inference_npz(
     output_path.with_suffix(".json").write_text(
         json.dumps(
             {
-                "schema_version": 1,
+                "schema_version": 2,
                 "seed": seed,
-                "source_font": str(validated_font),
+                "source_fonts": [str(path) for path in renderer.font_paths],
                 "count": len(valid),
                 "missing": [f"U+{value:04X}" for value in missing],
                 "samples": [
-                    {"codepoint": f"U+{cp:04X}", "reference": ref}
-                    for cp, ref in zip(valid, references)
+                    {
+                        "codepoint": f"U+{cp:04X}",
+                        "reference": ref,
+                        "source_font": source,
+                    }
+                    for cp, ref, source in zip(valid, references, selected_sources)
                 ],
             },
             ensure_ascii=False,

@@ -1,6 +1,6 @@
 import json
 
-from zi2zi_webui.models import TrainingRun
+from zi2zi_webui.models import ProjectManifest, TrainingRun
 from zi2zi_webui.storage import PROJECT_FOLDERS, Storage
 
 
@@ -45,3 +45,16 @@ def test_running_jobs_become_interrupted_on_restart(tmp_path):
     with storage._connect() as db:
         status = db.execute("SELECT status FROM jobs WHERE id='job'").fetchone()["status"]
     assert status == "interrupted"
+
+
+def test_legacy_single_source_font_manifest_migrates_to_ordered_lists():
+    project = ProjectManifest.from_dict(
+        {
+            "name": "Legacy",
+            "global_source_font": "global.ttf",
+            "regional_source_fonts": {"SC": "sc.ttf", "JP": ""},
+        }
+    )
+    assert project.global_source_fonts == ["global.ttf"]
+    assert project.regional_source_fonts["SC"] == ["sc.ttf"]
+    assert project.source_fonts_for_region("SC") == ["sc.ttf", "global.ttf"]

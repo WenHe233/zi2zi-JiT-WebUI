@@ -35,7 +35,12 @@ def get_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Generate FontSrcTarget dataset (train + test by default)."
     )
-    parser.add_argument("--source-font", required=True, help="Path to source/reference font.")
+    parser.add_argument(
+        "--source-font",
+        required=True,
+        nargs="+",
+        help="Ordered source/reference font paths; later fonts provide missing glyphs.",
+    )
     parser.add_argument("--font-dir", required=True, help="Directory containing target fonts.")
     parser.add_argument("--output-dir", required=True,
                         help="Root output directory. Train goes to <output-dir>/train, test to <output-dir>/test.")
@@ -100,7 +105,7 @@ def main() -> None:
         train_out = output_dir / "train"
         print(f"=== Generating train dataset -> {train_out} ===")
         train_summary = generate_train_dataset(
-            source_font=Path(args.source_font),
+            source_font=[Path(item) for item in args.source_font],
             font_dir=Path(args.font_dir),
             output_dir=train_out,
             num_fonts=args.num_fonts,
@@ -118,7 +123,7 @@ def main() -> None:
         test_out = output_dir / "test"
         print(f"\n=== Generating test dataset -> {test_out} ===")
         test_summary = generate_test_dataset(
-            source_font=Path(args.source_font),
+            source_font=[Path(item) for item in args.source_font],
             font_dir=Path(args.font_dir),
             train_dir=train_dir,
             output_dir=test_out,

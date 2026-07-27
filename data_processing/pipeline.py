@@ -15,6 +15,7 @@ from PIL import Image
 from .charsets import SUPPORTED_CHARSETS, get_charset_codepoints
 from .font_utils import (
     GlyphRenderer,
+    GlyphRendererPool,
     ensure_output_directory,
     extract_font_name,
     get_cjk_codepoints,
@@ -24,6 +25,14 @@ from .font_utils import (
 
 DEFAULT_IMAGE_RESOLUTION = 256
 DEFAULT_JPEG_QUALITY = 95
+SourceFonts = Path | List[Path]
+
+
+def _source_font_paths(value: SourceFonts) -> List[Path]:
+    paths = [value] if isinstance(value, Path) else list(value)
+    if not paths:
+        raise ValueError("At least one source font is required")
+    return [Path(path) for path in paths]
 
 
 def _format_codepoint(codepoint: int) -> str:
@@ -88,7 +97,7 @@ def _font_metadata(
     target_font_path: Path,
     target_font,
     target_codepoints: set[int],
-    source_font_path: Path,
+    source_font_path: SourceFonts,
     charset: Optional[str],
     font_index: Optional[int],
 ) -> dict:
@@ -96,7 +105,7 @@ def _font_metadata(
         "font_file": target_font_path.name,
         "font_name": extract_font_name(target_font, target_font_path),
         "total_cjk_glyphs": len(target_codepoints),
-        "source_font": source_font_path.name,
+        "source_fonts": [path.name for path in _source_font_paths(source_font_path)],
         "charset_filter": charset,
         "extraction_date": datetime.now().isoformat(),
     }
@@ -127,7 +136,7 @@ def _filename_for_codepoint(codepoint: int, local_index: int) -> str:
 
 
 def extract_train_src_target_refs(
-    source_font_path: Path,
+    source_font_path: SourceFonts,
     target_font_path: Path,
     output_dir: Path,
     sample_count: int = 500,
@@ -137,10 +146,10 @@ def extract_train_src_target_refs(
     seed: Optional[int] = None,
     font_index: Optional[int] = None,
 ) -> dict:
-    source_font, source_validated_path = load_font(str(source_font_path))
     target_font, target_validated_path = load_font(str(target_font_path))
 
-    source_codepoints = get_cjk_codepoints(source_font)
+    source_renderer = GlyphRendererPool(_source_font_paths(source_font_path), resolution)
+    source_codepoints = source_renderer.cjk_codepoints()
     target_codepoints = get_cjk_codepoints(target_font)
     common_codepoints = source_codepoints & target_codepoints
 
@@ -164,7 +173,6 @@ def extract_train_src_target_refs(
     selected_codepoints = _sample_codepoints(sorted(filtered_codepoints), sample_count, seed)
     ensure_output_directory(str(output_dir))
 
-    source_renderer = GlyphRenderer(str(source_validated_path), resolution)
     target_renderer = GlyphRenderer(str(target_validated_path), resolution)
 
     successful = 0
@@ -249,7 +257,7 @@ def load_training_codepoints(train_metadata_path: Path) -> List[int]:
 
 
 def extract_test_src_target_refs(
-    source_font_path: Path,
+    source_font_path: SourceFonts,
     target_font_path: Path,
     output_dir: Path,
     train_codepoints: List[int],
@@ -260,10 +268,10 @@ def extract_test_src_target_refs(
     seed: Optional[int] = None,
     font_index: Optional[int] = None,
 ) -> dict:
-    source_font, source_validated_path = load_font(str(source_font_path))
     target_font, target_validated_path = load_font(str(target_font_path))
 
-    source_codepoints = get_cjk_codepoints(source_font)
+    source_renderer = GlyphRendererPool(_source_font_paths(source_font_path), resolution)
+    source_codepoints = source_renderer.cjk_codepoints()
     target_codepoints = get_cjk_codepoints(target_font)
     common_codepoints = source_codepoints & target_codepoints
 
@@ -296,7 +304,6 @@ def extract_test_src_target_refs(
     selected_codepoints = _sample_codepoints(unseen_codepoints, test_sample_count, seed)
 
     ensure_output_directory(str(output_dir))
-    source_renderer = GlyphRenderer(str(source_validated_path), resolution)
     target_renderer = GlyphRenderer(str(target_validated_path), resolution)
 
     successful = 0
@@ -394,7 +401,7 @@ def _train_one_font(args_tuple):
 
 
 def generate_train_dataset(
-    source_font: Path,
+    source_font: SourceFonts,
     font_dir: Path,
     output_dir: Path,
     num_fonts: Optional[int] = None,
@@ -478,7 +485,7 @@ def _test_one_font(args_tuple):
 
 
 def generate_test_dataset(
-    source_font: Path,
+    source_font: SourceFonts,
     font_dir: Path,
     train_dir: Path,
     output_dir: Path,

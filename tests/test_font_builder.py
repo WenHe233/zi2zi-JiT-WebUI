@@ -3,6 +3,7 @@ from pathlib import Path
 from PIL import Image, ImageDraw
 from fontTools.ttLib import TTFont
 
+from data_processing.font_utils import GlyphRendererPool
 from zi2zi_webui.font_builder import (
     ATTRIBUTION,
     FontMetadata,
@@ -64,6 +65,28 @@ def test_target_font_creates_eight_style_references(tmp_path):
     references = render_style_references(output, tmp_path / "references")
     assert len(references) == 8
     assert all(Path(item).is_file() for item in references)
+
+
+def test_source_font_pool_uses_ordered_coverage_fallback(tmp_path):
+    source = tmp_path / "shape.png"
+    _glyph(source)
+    first = tmp_path / "Jigmo-1.ttf"
+    second = tmp_path / "Jigmo-2.ttf"
+    build_ttf(
+        {0x4E00: source, 0x4E01: source},
+        first,
+        FontMetadata(family_name="Jigmo 1"),
+    )
+    build_ttf(
+        {0x4E01: source, 0x4E02: source},
+        second,
+        FontMetadata(family_name="Jigmo 2"),
+    )
+    pool = GlyphRendererPool([first, second], 256)
+    assert pool.source_for(0x4E00) == first.resolve()
+    assert pool.source_for(0x4E01) == first.resolve()
+    assert pool.source_for(0x4E02) == second.resolve()
+    assert pool.render(0x4E02) is not None
 
 
 def test_attribution_over_200_glyphs(tmp_path, monkeypatch):

@@ -79,6 +79,24 @@ remain available for inference only. The WebUI binds to localhost by default
 and has no multi-user authentication; do not expose it to an untrusted
 network.
 
+#### Source font collections
+
+The global source and each SC/TC/JP/KR source can be an ordered collection of
+TTF/OTF files. For every Unicode code point, the first font containing that
+glyph is used and later fonts provide fallback coverage. This supports split
+families such as Jigmo without merging them into a font that would exceed the
+65,535-glyph TrueType limit. Put the preferred regional variant first; regional
+fonts are searched before the global fallback collection.
+
+The dataset CLIs accept the same ordered collection:
+
+```bash
+python scripts/generate_font_dataset.py \
+    --source-font Jigmo-1.ttf Jigmo-2.ttf Jigmo-3.ttf \
+    --font-dir data/sample_single_font \
+    --output-dir data/sample_dataset
+```
+
 #### Training dashboard
 
 Each run records TensorBoard events and an append-only `metrics.jsonl`. The

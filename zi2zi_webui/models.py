@@ -6,7 +6,7 @@ from typing import Any, Literal
 from uuid import uuid4
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 JobStatus = Literal["queued", "running", "succeeded", "failed", "cancelled", "interrupted"]
 
 
@@ -22,9 +22,9 @@ class ProjectManifest:
     created_at: str = field(default_factory=utc_now)
     updated_at: str = field(default_factory=utc_now)
     input_mode: Literal["font", "glyphs"] = "font"
-    global_source_font: str = ""
-    regional_source_fonts: dict[str, str] = field(
-        default_factory=lambda: {"SC": "", "TC": "", "JP": "", "KR": ""}
+    global_source_fonts: list[str] = field(default_factory=list)
+    regional_source_fonts: dict[str, list[str]] = field(
+        default_factory=lambda: {"SC": [], "TC": [], "JP": [], "KR": []}
     )
     target_assets: list[str] = field(default_factory=list)
     base_model: str = ""
@@ -44,8 +44,33 @@ class ProjectManifest:
 
     @classmethod
     def from_dict(cls, value: dict[str, Any]) -> "ProjectManifest":
+        value = dict(value)
+        legacy_global = value.pop("global_source_font", "")
+        if "global_source_fonts" not in value:
+            value["global_source_fonts"] = [legacy_global] if legacy_global else []
+        regional = value.get("regional_source_fonts") or {}
+        value["regional_source_fonts"] = {
+            region: (
+                list(fonts)
+                if isinstance(fonts, list)
+                else [fonts]
+                if isinstance(fonts, str) and fonts
+                else []
+            )
+            for region, fonts in {
+                "SC": regional.get("SC", []),
+                "TC": regional.get("TC", []),
+                "JP": regional.get("JP", []),
+                "KR": regional.get("KR", []),
+            }.items()
+        }
+        value["schema_version"] = SCHEMA_VERSION
         fields = cls.__dataclass_fields__
         return cls(**{key: item for key, item in value.items() if key in fields})
+
+    def source_fonts_for_region(self, region: str | None = None) -> list[str]:
+        regional = self.regional_source_fonts.get(region, []) if region else []
+        return list(dict.fromkeys([*regional, *self.global_source_fonts]))
 
 
 @dataclass

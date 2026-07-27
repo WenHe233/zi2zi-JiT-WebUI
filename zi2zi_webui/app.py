@@ -90,7 +90,7 @@ def build_app(
     def save_assets(
         project_id,
         input_mode,
-        source_font,
+        source_fonts,
         target_files,
         sc_font,
         tc_font,
@@ -101,10 +101,11 @@ def build_app(
             raise gr.Error("Select a project first")
         project = storage.get_project(project_id)
         project.input_mode = input_mode
-        if source_font:
-            project.global_source_font = str(
-                copy_project_input(storage, project_id, source_font, "source-font")
-            )
+        if source_fonts:
+            project.global_source_fonts = [
+                str(copy_project_input(storage, project_id, item, "source-font"))
+                for item in source_fonts
+            ]
         copied_targets = []
         for item in target_files or []:
             category = "target-font" if input_mode == "font" else "target-glyphs"
@@ -114,11 +115,22 @@ def build_app(
                 project.target_assets = [str(copied_targets[0].parent)]
             else:
                 project.target_assets = [str(item) for item in copied_targets[:1]]
-        for region, value in zip(("SC", "TC", "JP", "KR"), (sc_font, tc_font, jp_font, kr_font)):
-            if value:
-                project.regional_source_fonts[region] = str(
-                    copy_project_input(storage, project_id, value, f"source-{region.lower()}")
-                )
+        for region, values in zip(
+            ("SC", "TC", "JP", "KR"),
+            (sc_font, tc_font, jp_font, kr_font),
+        ):
+            if values:
+                project.regional_source_fonts[region] = [
+                    str(
+                        copy_project_input(
+                            storage,
+                            project_id,
+                            item,
+                            f"source-{region.lower()}",
+                        )
+                    )
+                    for item in values
+                ]
         if input_mode == "font" and project.target_assets:
             project.style_reference_pool = render_style_references(
                 project.target_assets[0],
@@ -387,8 +399,6 @@ def build_app(
         )
         if int(candidates) > 1 and len(codepoints) > 64 and not allow_large_candidates:
             raise gr.Error("Candidate generation is limited to 64 glyphs unless explicitly unlocked")
-        if not project.global_source_font:
-            raise gr.Error("A source font is required")
         if not project.style_reference_pool:
             raise gr.Error("The project needs at least one style reference")
         project.charset_presets = list(preset_ids or [])
@@ -414,13 +424,15 @@ def build_app(
         outputs = []
         fallbacks = []
         for region, region_codepoints in regional.items():
-            source_font = project.regional_source_fonts.get(region) or project.global_source_font
+            source_fonts = project.source_fonts_for_region(region)
+            if not source_fonts:
+                raise gr.Error(f"No source font is configured for region {region}")
             if not project.regional_source_fonts.get(region):
                 fallbacks.append(region)
             region_dir = request_dir / region
             npz = build_inference_npz(
                 region_codepoints,
-                source_font,
+                source_fonts,
                 project.style_reference_pool,
                 region_dir / "request.npz",
                 seed=int(seed),
@@ -649,14 +661,21 @@ def build_app(
                 value="font",
                 label=b("目标风格素材", "Target style source"),
             )
-            source_font = gr.File(label=b("全局内容/源字体", "Global content/source font"), type="filepath")
+            source_font = gr.File(
+                label=b(
+                    "全局内容/源字体（按顺序回退，可多选）",
+                    "Global content/source fonts (ordered fallback)",
+                ),
+                type="filepath",
+                file_count="multiple",
+            )
             target_files = gr.File(label=b("目标字体或字形图片", "Target font or glyph images"), type="filepath", file_count="multiple")
             with gr.Accordion(b("地区源字体（可选）", "Regional source fonts (optional)"), open=False):
                 with gr.Row():
-                    sc_font = gr.File(label="SC", type="filepath")
-                    tc_font = gr.File(label="TC", type="filepath")
-                    jp_font = gr.File(label="JP", type="filepath")
-                    kr_font = gr.File(label="KR", type="filepath")
+                    sc_font = gr.File(label="SC", type="filepath", file_count="multiple")
+                    tc_font = gr.File(label="TC", type="filepath", file_count="multiple")
+                    jp_font = gr.File(label="JP", type="filepath", file_count="multiple")
+                    kr_font = gr.File(label="KR", type="filepath", file_count="multiple")
             save_assets_btn = gr.Button(b("保存项目素材", "Save project assets"), variant="primary")
             asset_status = gr.Code(label=b("素材状态", "Asset status"), language="json")
 

@@ -1,5 +1,5 @@
 from pathlib import Path
-from typing import Optional, Set, Tuple
+from typing import Iterable, Optional, Set, Tuple
 
 from fontTools.ttLib import TTFont
 from PIL import Image, ImageDraw, ImageFont
@@ -198,3 +198,68 @@ class GlyphRenderer:
             return image
         except Exception:
             return None
+
+
+class GlyphRendererPool:
+    """Render from the first font in an ordered collection that owns a glyph."""
+
+    def __init__(
+        self,
+        font_paths: Iterable[str | Path],
+        resolution: int,
+        background_color: Tuple[int, int, int] = (255, 255, 255),
+        text_color: Tuple[int, int, int] = (0, 0, 0),
+    ):
+        paths = [validate_font_file(str(path)).resolve() for path in font_paths]
+        if not paths:
+            raise ValueError("At least one source font is required")
+        self.font_paths = list(dict.fromkeys(paths))
+        self.renderers = [
+            GlyphRenderer(
+                str(path),
+                resolution,
+                background_color=background_color,
+                text_color=text_color,
+            )
+            for path in self.font_paths
+        ]
+        self._candidates: dict[int, list[int]] = {}
+        for index, renderer in enumerate(self.renderers):
+            for codepoint in renderer._cmap:
+                self._candidates.setdefault(codepoint, []).append(index)
+        self._owners: dict[int, int] = {}
+        self._cmap = self._candidates
+        self.resolution = resolution
+
+    def _owner_for(self, codepoint: int) -> int | None:
+        if codepoint in self._owners:
+            return self._owners[codepoint]
+        candidates = self._candidates.get(codepoint, [])
+        if not candidates:
+            return None
+        owner = next(
+            (
+                index
+                for index in candidates
+                if has_valid_outline(self.renderers[index]._tt_font, codepoint)
+            ),
+            candidates[0],
+        )
+        self._owners[codepoint] = owner
+        return owner
+
+    def render(self, codepoint: int) -> Optional[Image.Image]:
+        owner = self._owner_for(codepoint)
+        if owner is None:
+            return None
+        return self.renderers[owner].render(codepoint)
+
+    def source_for(self, codepoint: int) -> Path | None:
+        owner = self._owner_for(codepoint)
+        return self.font_paths[owner] if owner is not None else None
+
+    def cjk_codepoints(self, filter_empty: bool = True) -> Set[int]:
+        values: set[int] = set()
+        for renderer in self.renderers:
+            values.update(get_cjk_codepoints(renderer._tt_font, filter_empty=filter_empty))
+        return values

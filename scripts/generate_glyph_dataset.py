@@ -43,7 +43,7 @@ logger = logging.getLogger(__name__)
 
 from PIL import Image
 
-from data_processing.font_utils import GlyphRenderer
+from data_processing.font_utils import GlyphRendererPool
 from data_processing.pipeline import (
     create_combined_image,
     _format_codepoint,
@@ -60,7 +60,12 @@ def get_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Generate FontSrcTarget dataset from pre-rendered glyph images."
     )
-    parser.add_argument("--source-font", required=True, help="Path to source/reference font (TTF/OTF).")
+    parser.add_argument(
+        "--source-font",
+        required=True,
+        nargs="+",
+        help="Ordered source/reference font paths; later fonts provide missing glyphs.",
+    )
     parser.add_argument("--glyph-dir", required=True, help="Directory containing glyph images ({char}.png).")
     parser.add_argument("--output-dir", required=True,
                         help="Root output directory. Creates train/ and test/ subdirectories.")
@@ -77,8 +82,9 @@ def get_args() -> argparse.Namespace:
 
     if not Path(args.glyph_dir).is_dir():
         parser.error(f"--glyph-dir does not exist: {args.glyph_dir}")
-    if not Path(args.source_font).is_file():
-        parser.error(f"--source-font does not exist: {args.source_font}")
+    for source_font in args.source_font:
+        if not Path(source_font).is_file():
+            parser.error(f"--source-font does not exist: {source_font}")
 
     return args
 
@@ -118,11 +124,11 @@ def generate_split(
     codepoints: List[int],
     ref_pool: List[int],
     glyph_map: dict,
-    source_renderer: GlyphRenderer,
+    source_renderer: GlyphRendererPool,
     output_dir: Path,
     font_name: str,
     font_index: int,
-    source_font_path: Path,
+    source_font_paths: list[Path],
     resolution: int,
     seed: int,
 ) -> dict:
@@ -168,7 +174,7 @@ def generate_split(
     metadata = {
         "font_name": font_name,
         "font_index": font_index,
-        "source_font": str(source_font_path),
+        "source_fonts": [str(path) for path in source_font_paths],
         "glyph_source": "image_folder",
         "dataset_type": split_name,
         "extraction_date": datetime.now().isoformat(),
@@ -192,7 +198,7 @@ def main() -> None:
 
     glyph_dir = Path(args.glyph_dir)
     output_dir = Path(args.output_dir)
-    source_font_path = Path(args.source_font)
+    source_font_paths = [Path(item) for item in args.source_font]
     font_name = args.font_name or glyph_dir.name
     font_index = args.font_index
     folder_name = f"{font_index:03d}_{font_name}"
@@ -224,14 +230,14 @@ def main() -> None:
     print(f"Glyphs: {total} total, {len(train_cps)} train, {len(test_cps)} test")
 
     # Source renderer
-    source_renderer = GlyphRenderer(str(source_font_path), args.resolution)
+    source_renderer = GlyphRendererPool(source_font_paths, args.resolution)
 
     # Generate train
     train_out = output_dir / "train" / folder_name
     print(f"\n=== Generating train -> {train_out} ===")
     train_result = generate_split(
         "train", train_cps, train_cps, glyph_map, source_renderer,
-        train_out, font_name, font_index, source_font_path, args.resolution, args.seed,
+        train_out, font_name, font_index, source_font_paths, args.resolution, args.seed,
     )
     print(f"  extracted={train_result['extracted']} failed={train_result['failed']}")
 
@@ -241,7 +247,7 @@ def main() -> None:
         print(f"\n=== Generating test -> {test_out} ===")
         test_result = generate_split(
             "test", test_cps, train_cps, glyph_map, source_renderer,
-            test_out, font_name, font_index, source_font_path, args.resolution, args.seed,
+            test_out, font_name, font_index, source_font_paths, args.resolution, args.seed,
         )
         print(f"  extracted={test_result['extracted']} failed={test_result['failed']}")
 

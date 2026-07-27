@@ -63,6 +63,23 @@ docker compose up --build
 完整训练流程要求 NVIDIA CUDA GPU；CPU 与 Apple MPS 仅支持推理。WebUI 默认只
 监听本机且没有多用户鉴权，请勿直接暴露到不可信网络。
 
+#### 多源字体回退
+
+全局源字体以及 SC/TC/JP/KR 各地区源字体都可以选择一组有序的 TTF/OTF。
+系统针对每个 Unicode 码位，从前向后使用第一个包含该字形的字体，其余字体负责
+补缺。这样可直接使用 Jigmo 一类因 65,535 glyph 上限而拆分的字体，无需先合并。
+如多个字体包含同一码位，请把希望采用的地区字形排在前面；地区字体组会优先于
+全局回退字体组。
+
+数据集 CLI 同样支持一次传入多个源字体：
+
+```bash
+python scripts/generate_font_dataset.py \
+    --source-font Jigmo-1.ttf Jigmo-2.ttf Jigmo-3.ttf \
+    --font-dir data/sample_single_font \
+    --output-dir data/sample_dataset
+```
+
 训练仪表盘同时记录 TensorBoard 和 `metrics.jsonl`，显示 loss/EMA、学习率、
 吞吐、ETA、GPU/CPU/RAM/磁盘、固定字形快照及 SSIM、LPIPS、L1、FID。可叠加
 比较同项目最多五次训练，并导出 CSV/JSON 与当前图表 PNG。启用完整评估后保留 `last`、

@@ -117,16 +117,24 @@ def dataset_command(
 ) -> tuple[list[str], Path]:
     project_dir = storage.project_dir(manifest.id)
     output = project_dir / "datasets" / f"dataset-{charset}"
+    charset_region = {
+        "gb2312": "SC",
+        "gbk": "SC",
+        "big5": "TC",
+        "jisx0208": "JP",
+        "ksx1001": "KR",
+    }.get(charset)
+    source_fonts = manifest.source_fonts_for_region(charset_region)
     if manifest.input_mode == "font":
-        if not manifest.global_source_font or not manifest.target_assets:
-            raise ValueError("Source font and target font are required")
+        if not source_fonts or not manifest.target_assets:
+            raise ValueError("At least one source font and one target font are required")
         target = Path(manifest.target_assets[0])
         target_dir = target.parent
         command = [
             sys.executable,
             str(ROOT / "scripts" / "generate_font_dataset.py"),
             "--source-font",
-            manifest.global_source_font,
+            *source_fonts,
             "--font-dir",
             str(target_dir),
             "--output-dir",
@@ -143,13 +151,13 @@ def dataset_command(
             str(workers),
         ]
     else:
-        if not manifest.global_source_font or not manifest.target_assets:
-            raise ValueError("Source font and glyph directory are required")
+        if not source_fonts or not manifest.target_assets:
+            raise ValueError("At least one source font and a glyph directory are required")
         command = [
             sys.executable,
             str(ROOT / "scripts" / "generate_glyph_dataset.py"),
             "--source-font",
-            manifest.global_source_font,
+            *source_fonts,
             "--glyph-dir",
             manifest.target_assets[0],
             "--output-dir",

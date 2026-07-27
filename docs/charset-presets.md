@@ -45,9 +45,12 @@ expected unique counts.
 
 When more than one regional preset is selected, the WebUI can produce
 separate SC, TC, JP and KR fonts. A model receives glyph structure from the
-content/source font, so users may assign a different source font to each
-region. Falling back to one global source font changes coverage but does not
-create authentic regional variants for overlapping Unicode code points.
+content/source fonts, so users may assign an ordered font collection to each
+region. For each code point, the first covering regional font wins, followed
+by the ordered global fallback collection. This supports split collections
+such as Jigmo without merging beyond the TrueType glyph limit. Fallback
+coverage alone does not create authentic regional variants for overlapping
+Unicode code points, so preferred regional fonts should come first.
 
 The optional merged-font mode requires a primary region. Regional splitting
 is the default.
