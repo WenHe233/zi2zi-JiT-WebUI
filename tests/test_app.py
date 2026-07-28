@@ -147,3 +147,22 @@ def test_generation_page_has_dynamic_lora_checkpoint_selector(tmp_path):
         assert selector.preprocess("restored-checkpoint.pth") == "restored-checkpoint.pth"
     finally:
         jobs.stop()
+
+
+def test_review_and_export_pages_select_generation_batches(tmp_path):
+    storage = Storage(tmp_path / "state")
+    storage.create_project("Batches")
+    jobs = JobManager(storage)
+    try:
+        app = build_app(storage, jobs, language="en")
+        labels = {
+            getattr(block, "label", "")
+            for block in app.blocks.values()
+        }
+        assert "Generation batch" in labels
+        assert "Generation batch to export" in labels
+        assert "Search character or codepoint" in labels
+        assert "Page" in labels
+        assert "Generated glyph directory" not in labels
+    finally:
+        jobs.stop()

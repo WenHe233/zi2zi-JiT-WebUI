@@ -28,6 +28,11 @@ def main() -> None:
     parser.add_argument("--threshold", type=int, default=180)
     parser.add_argument("--despeckle-area", type=int, default=4)
     parser.add_argument("--selection-manifest", default="")
+    parser.add_argument(
+        "--selection-only",
+        action="store_true",
+        help="Build only glyph paths listed by --selection-manifest.",
+    )
     parser.add_argument("--project-dir", default="")
     parser.add_argument(
         "--base-font",
@@ -43,7 +48,7 @@ def main() -> None:
             raise SystemExit(
                 f"--output must be directly inside the project fonts directory: {fonts_root}"
             )
-    glyphs = scan_glyph_directory(args.glyph_dir)
+    glyphs = {} if args.selection_only else scan_glyph_directory(args.glyph_dir)
     if args.selection_manifest:
         selections = json.loads(Path(args.selection_manifest).read_text(encoding="utf-8"))
         for label, path in selections.items():

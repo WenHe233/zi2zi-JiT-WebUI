@@ -12,9 +12,15 @@ from .charts import latest_summary, run_parameter_rows, training_figures
 from .devices import detect_devices, disk_free_gb
 from .font_builder import (
     FontMetadata,
-    codepoint_from_filename,
-    scan_glyph_directory,
     validate_font_metadata,
+)
+from .generation_batches import (
+    batch_choices,
+    candidates_for_codepoint,
+    load_and_prune_selections,
+    review_page as generation_review_page,
+    scan_generation_batch,
+    validate_batch_path,
 )
 from .i18n import translator
 from .inference import (
@@ -731,42 +737,98 @@ def build_app(
             ),
         )
 
-    def find_generated(project_id):
-        root = storage.project_dir(project_id) / "generation"
-        images = sorted(root.rglob("*.png"), key=lambda item: item.stat().st_mtime, reverse=True)
-        return [str(item) for item in images[:500]]
+    def generation_batch_options(project_id):
+        if not project_id:
+            return gr.update(choices=[], value=None)
+        choices, preferred = batch_choices(
+            storage.project_dir(project_id) / "generation"
+        )
+        return gr.update(choices=choices, value=preferred)
 
-    def candidate_groups(project_id):
-        groups: dict[str, list[str]] = {}
-        for image in find_generated(project_id):
-            codepoint = codepoint_from_filename(image)
-            if codepoint is not None:
-                groups.setdefault(f"U+{codepoint:04X}", []).append(image)
-        choices = sorted(groups)
-        return gr.update(choices=choices, value=choices[0] if choices else None)
+    def refresh_review_page(project_id, batch_path, search, page):
+        if not project_id or not batch_path:
+            return [], gr.update(choices=[], value=None), 1, "No generation batch."
+        project = storage.get_project(project_id)
+        batch = validate_batch_path(
+            storage.project_dir(project_id) / "generation",
+            batch_path,
+        )
+        images, codepoints, current_page, total_pages = generation_review_page(
+            batch,
+            search=str(search or ""),
+            page=int(page or 1),
+            page_size=100,
+            primary_region=project.primary_region,
+        )
+        choices = [f"U+{codepoint:04X}" for codepoint in codepoints]
+        selection_path = (
+            storage.project_dir(project_id) / "glyphs" / "selection.json"
+        )
+        load_and_prune_selections(selection_path)
+        return (
+            [str(path) for path in images],
+            gr.update(choices=choices, value=choices[0] if choices else None),
+            current_page,
+            (
+                f"{len(codepoints)} glyphs on page {current_page}/{total_pages}; "
+                "100 glyphs per page."
+            ),
+        )
 
-    def candidate_gallery(project_id, codepoint_label):
+    def candidate_gallery(project_id, batch_path, codepoint_label):
         if not codepoint_label:
             return [], gr.update(choices=[])
+        batch = validate_batch_path(
+            storage.project_dir(project_id) / "generation",
+            batch_path,
+        )
         images = [
-            item
-            for item in find_generated(project_id)
-            if codepoint_from_filename(item) == int(codepoint_label[2:], 16)
+            str(path)
+            for path in candidates_for_codepoint(
+                batch,
+                int(codepoint_label[2:], 16),
+            )
         ]
-        return images, gr.update(choices=images, value=images[0] if images else None)
+        return images, gr.update(
+            choices=images,
+            value=images[0] if images else None,
+        )
 
-    def save_candidate(project_id, codepoint_label, image_path):
+    def save_candidate(project_id, batch_path, codepoint_label, image_path):
         if not codepoint_label or not image_path:
             raise gr.Error("Choose a glyph and candidate")
+        batch = validate_batch_path(
+            storage.project_dir(project_id) / "generation",
+            batch_path,
+        )
+        candidate = Path(image_path).resolve()
+        if not candidate.is_file() or batch not in candidate.parents:
+            raise gr.Error("The selected candidate is not part of this batch")
         path = storage.project_dir(project_id) / "glyphs" / "selection.json"
-        values = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
-        values[codepoint_label] = image_path
+        values = load_and_prune_selections(path)
+        values[codepoint_label] = str(candidate)
         path.write_text(json.dumps(values, ensure_ascii=False, indent=2), encoding="utf-8")
-        return f"Selected {Path(image_path).name} for {codepoint_label}"
+        return f"Selected {candidate.name} for {codepoint_label}"
+
+    def clear_candidate(project_id, codepoint_label):
+        if not project_id or not codepoint_label:
+            raise gr.Error("Choose a glyph")
+        path = storage.project_dir(project_id) / "glyphs" / "selection.json"
+        values = load_and_prune_selections(path)
+        removed = values.pop(codepoint_label, None)
+        path.write_text(
+            json.dumps(values, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        return (
+            f"Cleared selection for {codepoint_label}"
+            if removed
+            else f"No manual selection existed for {codepoint_label}"
+        )
 
     def queue_font(
         project_id,
-        glyph_dir,
+        generation_batch,
         family,
         style,
         version,
@@ -789,29 +851,39 @@ def build_app(
         except ValueError as exc:
             raise gr.Error(str(exc)) from exc
         selection = project_dir / "glyphs" / "selection.json"
-        if not str(glyph_dir or "").strip():
-            raise gr.Error("Choose a generated glyph directory")
+        if not str(generation_batch or "").strip():
+            raise gr.Error("Choose a generation batch")
         try:
-            discovered_glyphs = scan_glyph_directory(glyph_dir)
+            batch = validate_batch_path(
+                project_dir / "generation",
+                generation_batch,
+            )
+            selected_values = load_and_prune_selections(selection)
+            discovered_glyphs = scan_generation_batch(
+                batch,
+                primary_region=project.primary_region,
+                selections=selected_values,
+            )
         except (OSError, ValueError) as exc:
             raise gr.Error(str(exc)) from exc
-        selected_codepoints: set[int] = set()
-        if selection.is_file():
-            try:
-                selected_values = json.loads(selection.read_text(encoding="utf-8"))
-                selected_codepoints = {
-                    int(label.removeprefix("U+"), 16)
-                    for label, image_path in selected_values.items()
-                    if Path(image_path).is_file()
-                }
-            except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
-                raise gr.Error(f"Invalid glyph selection manifest: {exc}") from exc
-        effective_glyph_count = len(set(discovered_glyphs) | selected_codepoints)
+        effective_glyph_count = len(discovered_glyphs)
         if not effective_glyph_count:
             raise gr.Error(
                 "No U+XXXX-named glyph images were found recursively. "
                 "Font export was stopped to avoid silently copying the target font unchanged."
             )
+        export_selection = project_dir / "glyphs" / f"export-{uuid4().hex}.json"
+        export_selection.write_text(
+            json.dumps(
+                {
+                    f"U+{codepoint:04X}": str(path)
+                    for codepoint, path in sorted(discovered_glyphs.items())
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
         base_font_path = ""
         if project.input_mode == "font":
             if not project.target_assets:
@@ -843,7 +915,7 @@ def build_app(
                 sys.executable,
                 str(ROOT / "scripts" / "build_font.py"),
                 "--glyph-dir",
-                glyph_dir,
+                str(batch),
                 "--output",
                 str(output),
                 "--family",
@@ -867,8 +939,11 @@ def build_app(
             ]
             if base_font_path:
                 command += ["--base-font", base_font_path]
-            if selection.exists():
-                command += ["--selection-manifest", str(selection)]
+            command += [
+                "--selection-manifest",
+                str(export_selection),
+                "--selection-only",
+            ]
             job_ids.append(
                 jobs.submit("font_build", command, project_id=project_id, cwd=ROOT)
             )
@@ -1026,8 +1101,12 @@ def build_app(
         initial_checkpoint_choices, initial_checkpoint = (
             generation_checkpoint_options(initial_project, storage)
         )
+        initial_batch_choices, initial_batch = batch_choices(
+            storage.project_dir(initial_project_id) / "generation"
+        )
     else:
         initial_checkpoint_choices, initial_checkpoint = [], None
+        initial_batch_choices, initial_batch = [], None
 
     with gr.Blocks(title=t("app_title"), theme=gr.themes.Soft()) as app:
         gr.Markdown(
@@ -1378,13 +1457,40 @@ def build_app(
             generation_status = gr.Markdown()
 
         with gr.Tab(t("review")):
-            refresh_gallery_btn = gr.Button(b("刷新生成字形", "Refresh generated glyphs"))
+            with gr.Row():
+                review_batch = gr.Dropdown(
+                    choices=initial_batch_choices,
+                    value=initial_batch,
+                    label=b("生成批次", "Generation batch"),
+                    allow_custom_value=True,
+                )
+                refresh_review_batches_btn = gr.Button(
+                    b("刷新批次", "Refresh batches")
+                )
+            with gr.Row():
+                review_search = gr.Textbox(
+                    label=b("搜索字符或码位", "Search character or codepoint")
+                )
+                review_page_number = gr.Number(
+                    value=1,
+                    precision=0,
+                    minimum=1,
+                    label=b("页码", "Page"),
+                )
+                refresh_gallery_btn = gr.Button(
+                    b("刷新当前页", "Refresh current page")
+                )
+            review_page_status = gr.Markdown()
             generated_gallery = gr.Gallery(label=b("生成字形", "Generated glyphs"), columns=8, height=500)
             with gr.Row():
                 review_codepoint = gr.Dropdown(label=b("码位", "Codepoint"))
                 review_candidate = gr.Dropdown(label=b("所选候选文件", "Selected candidate file"))
             candidate_gallery_component = gr.Gallery(label=b("候选", "Candidates"), columns=4, height=300)
-            save_candidate_btn = gr.Button(b("采用此候选", "Use this candidate"))
+            with gr.Row():
+                save_candidate_btn = gr.Button(b("采用此候选", "Use this candidate"))
+                clear_candidate_btn = gr.Button(
+                    b("清除人工选择", "Clear manual selection")
+                )
             candidate_status = gr.Markdown()
 
         with gr.Tab(t("export")):
@@ -1398,7 +1504,16 @@ def build_app(
                     "incremental packaging.",
                 )
             )
-            glyph_dir = gr.Textbox(label=b("生成字形目录", "Generated glyph directory"))
+            with gr.Row():
+                export_batch = gr.Dropdown(
+                    choices=initial_batch_choices,
+                    value=initial_batch,
+                    label=b("用于导出的生成批次", "Generation batch to export"),
+                    allow_custom_value=True,
+                )
+                refresh_export_batches_btn = gr.Button(
+                    b("刷新批次", "Refresh batches")
+                )
             with gr.Row():
                 family_name = gr.Textbox(label=b("字体家族名", "Family name"))
                 style_name = gr.Textbox(value="Regular", label=b("样式", "Style"))
@@ -1465,6 +1580,16 @@ def build_app(
             generation_checkpoint_choices,
             project_selector,
             generation_checkpoint,
+        )
+        project_selector.change(
+            generation_batch_options,
+            project_selector,
+            review_batch,
+        )
+        project_selector.change(
+            generation_batch_options,
+            project_selector,
+            export_batch,
         )
         project_selector.change(
             lambda: False,
@@ -1574,23 +1699,61 @@ def build_app(
             ],
             [generation_output, generation_status],
         )
-        refresh_gallery_btn.click(find_generated, project_selector, generated_gallery)
-        refresh_gallery_btn.click(candidate_groups, project_selector, review_codepoint)
+        refresh_review_batches_btn.click(
+            generation_batch_options,
+            project_selector,
+            review_batch,
+        )
+        refresh_export_batches_btn.click(
+            generation_batch_options,
+            project_selector,
+            export_batch,
+        )
+        refresh_gallery_btn.click(
+            refresh_review_page,
+            [project_selector, review_batch, review_search, review_page_number],
+            [
+                generated_gallery,
+                review_codepoint,
+                review_page_number,
+                review_page_status,
+            ],
+        )
+        review_batch.change(
+            refresh_review_page,
+            [project_selector, review_batch, review_search, review_page_number],
+            [
+                generated_gallery,
+                review_codepoint,
+                review_page_number,
+                review_page_status,
+            ],
+        )
         review_codepoint.change(
             candidate_gallery,
-            [project_selector, review_codepoint],
+            [project_selector, review_batch, review_codepoint],
             [candidate_gallery_component, review_candidate],
         )
         save_candidate_btn.click(
             save_candidate,
-            [project_selector, review_codepoint, review_candidate],
+            [
+                project_selector,
+                review_batch,
+                review_codepoint,
+                review_candidate,
+            ],
+            candidate_status,
+        )
+        clear_candidate_btn.click(
+            clear_candidate,
+            [project_selector, review_codepoint],
             candidate_status,
         )
         build_font_btn.click(
             queue_font,
             [
                 project_selector,
-                glyph_dir,
+                export_batch,
                 family_name,
                 style_name,
                 font_version,
