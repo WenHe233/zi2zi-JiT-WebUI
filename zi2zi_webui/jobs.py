@@ -145,34 +145,69 @@ class JobManager:
         env: dict[str, str] | None = None,
         resume_point: str | Path | None = None,
     ) -> str:
-        job_id = str(uuid4())
-        workdir = str(Path(cwd or Path.cwd()).resolve())
-        log_dir = self.storage.project_dir(project_id) / "logs" if project_id else self.storage.root / "logs"
-        log_dir.mkdir(parents=True, exist_ok=True)
-        log_path = log_dir / f"{job_id}.log"
+        return self.submit_many(
+            [
+                {
+                    "job_type": job_type,
+                    "command": command,
+                    "project_id": project_id,
+                    "cwd": cwd,
+                    "gpu": gpu,
+                    "env": env,
+                    "resume_point": resume_point,
+                }
+            ]
+        )[0]
+
+    def submit_many(self, specifications: list[dict[str, Any]]) -> list[str]:
+        """Persist a batch of jobs in one transaction, then enqueue all of them."""
+        if not specifications:
+            return []
+        records = []
+        for specification in specifications:
+            job_id = str(uuid4())
+            project_id = specification.get("project_id")
+            workdir = str(
+                Path(specification.get("cwd") or Path.cwd()).resolve()
+            )
+            log_dir = (
+                self.storage.project_dir(project_id) / "logs"
+                if project_id
+                else self.storage.root / "logs"
+            )
+            log_dir.mkdir(parents=True, exist_ok=True)
+            records.append(
+                (
+                    job_id,
+                    project_id,
+                    str(specification["job_type"]),
+                    json.dumps(specification["command"]),
+                    workdir,
+                    (
+                        None
+                        if specification.get("gpu") is None
+                        else str(specification["gpu"])
+                    ),
+                    json.dumps(specification.get("env") or {}),
+                    str(log_dir / f"{job_id}.log"),
+                    str(specification.get("resume_point") or ""),
+                    utc_now(),
+                )
+            )
         with self.storage._connect() as db:
-            db.execute(
+            db.executemany(
                 """
                 INSERT INTO jobs(
                     id, project_id, job_type, status, command_json, cwd, gpu,
                     env_json, log_path, resume_point, created_at
                 ) VALUES (?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (
-                    job_id,
-                    project_id,
-                    job_type,
-                    json.dumps(command),
-                    workdir,
-                    None if gpu is None else str(gpu),
-                    json.dumps(env or {}),
-                    str(log_path),
-                    str(resume_point or ""),
-                    utc_now(),
-                ),
+                records,
             )
-        self._queue.put(job_id)
-        return job_id
+        job_ids = [record[0] for record in records]
+        for job_id in job_ids:
+            self._queue.put(job_id)
+        return job_ids
 
     def list_jobs(self, project_id: str | None = None, limit: int = 100) -> list[dict[str, Any]]:
         query = "SELECT * FROM jobs"

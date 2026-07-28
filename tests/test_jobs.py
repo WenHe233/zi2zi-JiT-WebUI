@@ -1,6 +1,8 @@
 import sys
 import time
 
+import pytest
+
 from zi2zi_webui.jobs import JobManager, parse_job_progress, summarize_failure
 from zi2zi_webui.storage import Storage
 
@@ -103,5 +105,49 @@ def test_live_job_progress_is_persisted(tmp_path):
             time.sleep(0.05)
         assert observed
         assert "25%" in manager.get_job(job_id)["progress_text"]
+    finally:
+        manager.stop()
+
+
+def test_submit_many_persists_all_jobs_before_enqueuing(tmp_path):
+    storage = Storage(tmp_path / "state")
+    manager = JobManager(storage)
+    try:
+        job_ids = manager.submit_many(
+            [
+                {
+                    "job_type": "generation",
+                    "command": [sys.executable, "-c", "print('SC')"],
+                    "cwd": tmp_path,
+                },
+                {
+                    "job_type": "generation",
+                    "command": [sys.executable, "-c", "print('TC')"],
+                    "cwd": tmp_path,
+                },
+            ]
+        )
+        assert len(job_ids) == 2
+        assert {job["id"] for job in manager.list_jobs()} == set(job_ids)
+    finally:
+        manager.stop()
+
+
+def test_submit_many_does_not_persist_a_partial_invalid_batch(tmp_path):
+    storage = Storage(tmp_path / "state")
+    manager = JobManager(storage)
+    try:
+        with pytest.raises(KeyError):
+            manager.submit_many(
+                [
+                    {
+                        "job_type": "generation",
+                        "command": [sys.executable, "-c", "print('valid')"],
+                        "cwd": tmp_path,
+                    },
+                    {"job_type": "generation", "cwd": tmp_path},
+                ]
+            )
+        assert manager.list_jobs() == []
     finally:
         manager.stop()

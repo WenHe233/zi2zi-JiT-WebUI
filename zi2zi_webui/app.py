@@ -18,10 +18,11 @@ from .font_builder import (
 )
 from .i18n import translator
 from .inference import (
-    build_inference_npz,
+    build_generation_request,
     choose_diverse_references,
     exclude_existing_target_glyphs,
     render_style_references,
+    write_generation_request,
 )
 from .jobs import JobManager
 from .presets import (
@@ -573,44 +574,7 @@ def build_app(
         )
         if int(candidates) > 1 and len(codepoints) > 64 and not allow_large_candidates:
             raise gr.Error("Candidate generation is limited to 64 glyphs unless explicitly unlocked")
-        project.charset_presets = list(preset_ids or [])
-        project.split_regions = bool(split_regions)
-        project.primary_region = primary_region
-        storage.save_project(project)
         request_id = uuid4().hex[:10]
-        request_dir = storage.project_dir(project_id) / "generation" / f"request-{request_id}"
-        request_dir.mkdir(parents=True, exist_ok=True)
-        write_selection_manifest(
-            request_dir / "charset.json",
-            list(preset_ids or []),
-            requested_codepoints,
-            increments,
-        )
-        (request_dir / "generation-plan.json").write_text(
-            json.dumps(
-                {
-                    "schema_version": 1,
-                    "target_font": (
-                        project.target_assets[0]
-                        if project.input_mode == "font" and project.target_assets
-                        else ""
-                    ),
-                    "checkpoint": selected_checkpoint,
-                    "requested_count": len(requested_codepoints),
-                    "skipped_existing_count": len(skipped_existing),
-                    "generation_count": len(codepoints),
-                    "skipped_existing": [
-                        f"U+{value:04X}" for value in skipped_existing
-                    ],
-                    "generation_codepoints": [
-                        f"U+{value:04X}" for value in codepoints
-                    ],
-                },
-                ensure_ascii=False,
-                indent=2,
-            ),
-            encoding="utf-8",
-        )
         if split_regions:
             regional = resolve_selection_by_region(
                 preset_ids or [],
@@ -643,45 +607,108 @@ def build_app(
                     "characters already exist in the target font.",
                 ),
             )
-        if not project.style_reference_pool:
-            raise gr.Error("The project needs at least one style reference")
-        job_ids = []
-        outputs = []
+        if len(project.style_reference_pool) < 8:
+            raise gr.Error("The project needs at least 8 style references")
+        request_dir = (
+            storage.project_dir(project_id)
+            / "generation"
+            / f"request-{request_id}"
+        )
+        payloads = {}
         fallbacks = []
-        for region, region_codepoints in regional.items():
-            source_fonts = project.source_fonts_for_region(region)
-            if not source_fonts:
-                raise gr.Error(f"No source font is configured for region {region}")
-            if not project.regional_source_fonts.get(region):
-                fallbacks.append(region)
+        try:
+            for region, region_codepoints in regional.items():
+                source_fonts = project.source_fonts_for_region(region)
+                if not source_fonts:
+                    raise ValueError(
+                        f"No source font is configured for region {region}"
+                    )
+                if not project.regional_source_fonts.get(region):
+                    fallbacks.append(region)
+                payloads[region] = build_generation_request(
+                    region_codepoints,
+                    source_fonts,
+                    project.style_reference_pool,
+                    project_id=project_id,
+                    request_id=request_id,
+                    region=region,
+                    checkpoint=selected_checkpoint,
+                    seed=int(seed),
+                    candidates=int(candidates),
+                )
+        except (OSError, ValueError) as exc:
+            raise gr.Error(str(exc)) from exc
+
+        request_dir.mkdir(parents=True, exist_ok=False)
+        write_selection_manifest(
+            request_dir / "charset.json",
+            list(preset_ids or []),
+            requested_codepoints,
+            increments,
+        )
+        (request_dir / "generation-plan.json").write_text(
+            json.dumps(
+                {
+                    "schema_version": 2,
+                    "kind": "zi2zi-generation-plan",
+                    "request_id": request_id,
+                    "target_font": (
+                        project.target_assets[0]
+                        if project.input_mode == "font" and project.target_assets
+                        else ""
+                    ),
+                    "checkpoint": selected_checkpoint,
+                    "seed": int(seed),
+                    "candidates": int(candidates),
+                    "requested_count": len(requested_codepoints),
+                    "skipped_existing_count": len(skipped_existing),
+                    "generation_count": len(codepoints),
+                    "regions": {
+                        region: payload["count"]
+                        for region, payload in payloads.items()
+                    },
+                    "skipped_existing": [
+                        f"U+{value:04X}" for value in skipped_existing
+                    ],
+                    "generation_codepoints": [
+                        f"U+{value:04X}" for value in codepoints
+                    ],
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        specifications = []
+        outputs = []
+        for region, payload in payloads.items():
             region_dir = request_dir / region
-            npz = build_inference_npz(
-                region_codepoints,
-                source_fonts,
-                project.style_reference_pool,
-                region_dir / "request.npz",
-                seed=int(seed),
+            request_manifest = write_generation_request(
+                payload,
+                region_dir / "request.json",
             )
             command, output = generation_command(
                 project,
                 storage,
-                npz,
+                request_manifest,
                 device,
                 seed=int(seed),
                 candidates=int(candidates),
-                output_name=f"{request_id}-{region}-seed-{int(seed)}",
+                output_dir=region_dir,
+                request_manifest=True,
                 checkpoint_path=selected_checkpoint,
             )
             outputs.append(output)
-            job_ids.append(
-                jobs.submit(
-                    "generation",
-                    command,
-                    project_id=project_id,
-                    cwd=ROOT,
-                    gpu=device if str(device).isdigit() else None,
-                )
+            specifications.append(
+                {
+                    "job_type": "generation",
+                    "command": command,
+                    "project_id": project_id,
+                    "cwd": ROOT,
+                    "gpu": device if str(device).isdigit() else None,
+                }
             )
+        job_ids = jobs.submit_many(specifications)
         warning = (
             f" Source-font fallback used for {', '.join(sorted(set(fallbacks)))}; "
             "review regional glyph variants."
@@ -690,6 +717,9 @@ def build_app(
         )
         project.active_checkpoint = selected_checkpoint
         project.inference["checkpoint"] = selected_checkpoint
+        project.charset_presets = list(preset_ids or [])
+        project.split_regions = bool(split_regions)
+        project.primary_region = primary_region
         storage.save_project(project)
         return (
             "\n".join(str(item) for item in outputs),

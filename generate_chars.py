@@ -20,10 +20,15 @@ Usage:
 
     # Pairwise output (source|generated side by side)
     python generate_chars.py --checkpoint path/to/checkpoint.pth --test_npz test.npz --pairwise target_gen
+
+    # Lazy WebUI request (source/reference images are rendered per batch)
+    python generate_chars.py --checkpoint path/to/checkpoint.pth --request-manifest request.json
 """
 import argparse
+import json
 import os
 from contextlib import nullcontext
+from pathlib import Path
 
 import torch
 import torch.distributed as dist
@@ -32,6 +37,8 @@ import cv2
 
 import util.misc as misc
 from util.lora_utils import inject_lora, _is_lora_state_dict
+from data_processing.font_utils import GlyphRendererPool
+from zi2zi_webui.inference import _style_image
 
 
 DEFAULT_STEPS_BY_METHOD = {
@@ -47,8 +54,11 @@ def get_args_parser():
     # Required paths
     parser.add_argument('--checkpoint', type=str, required=True,
                         help='Path to model checkpoint')
-    parser.add_argument('--test_npz', type=str, required=True,
-                        help='Path to test npz file')
+    inputs = parser.add_mutually_exclusive_group(required=True)
+    inputs.add_argument('--test_npz', type=str,
+                        help='Path to a legacy test npz file')
+    inputs.add_argument('--request-manifest', type=str,
+                        help='Path to a WebUI generation request v2 JSON file')
     parser.add_argument('--output_dir', type=str, default='./eval_output',
                         help='Output directory for generated images')
     parser.add_argument('--device', type=str, default='auto',
@@ -157,6 +167,123 @@ def patch_torch_for_device(device):
         torch.compile = _identity_compile
 
     torch.cuda.amp.autocast = lambda *args, **kwargs: nullcontext()
+
+
+def _parse_codepoint(value):
+    if isinstance(value, int):
+        return value
+    text = str(value).strip()
+    if text.upper().startswith("U+"):
+        text = text[2:]
+    return int(text, 16)
+
+
+class NpzInputSource:
+    def __init__(self, path, pairwise):
+        self.path = str(Path(path).resolve())
+        self.data = np.load(path)
+        self.font_labels = self.data['font_labels']
+        self.char_labels = self.data['char_labels']
+        self.style_images = self.data['style_images']
+        self.content_images = self.data['content_images']
+        self.unicode_labels = (
+            self.data['unicode_labels']
+            if 'unicode_labels' in self.data
+            else None
+        )
+        self.target_images = None
+        if pairwise == 'target_gen':
+            if 'target_images' not in self.data:
+                raise ValueError(
+                    "target_gen pairwise mode requires 'target_images' in npz file"
+                )
+            self.target_images = self.data['target_images']
+        self.count = len(self.font_labels)
+        self.request = None
+
+    def sample(self, index):
+        return {
+            'font_label': int(self.font_labels[index]),
+            'char_label': int(self.char_labels[index]),
+            'style_image': self.style_images[index],
+            'content_image': self.content_images[index],
+            'target_image': (
+                self.target_images[index]
+                if self.target_images is not None
+                else None
+            ),
+            'unicode_label': (
+                int(self.unicode_labels[index])
+                if self.unicode_labels is not None
+                else None
+            ),
+        }
+
+    def close(self):
+        self.data.close()
+
+
+class ManifestInputSource:
+    def __init__(self, path, pairwise):
+        if pairwise == 'target_gen':
+            raise ValueError(
+                "target_gen pairwise mode is unavailable for generation requests"
+            )
+        self.path = str(Path(path).resolve())
+        self.request = json.loads(Path(path).read_text(encoding='utf-8'))
+        if (
+            self.request.get('schema_version') != 2
+            or self.request.get('kind') != 'zi2zi-generation-request'
+        ):
+            raise ValueError('Unsupported generation request manifest')
+        self.samples = list(self.request.get('samples') or [])
+        if not self.samples:
+            raise ValueError('Generation request does not contain any samples')
+        if self.request.get('count') != len(self.samples):
+            raise ValueError('Generation request sample count is inconsistent')
+        self.renderer = GlyphRendererPool(
+            self.request.get('source_fonts') or [],
+            int(self.request.get('resolution', 256)),
+        )
+        self.style_cache = {}
+        self.count = len(self.samples)
+
+    def sample(self, index):
+        item = self.samples[index]
+        codepoint = _parse_codepoint(item['codepoint'])
+        expected_source = Path(item['source_font']).resolve()
+        actual_source = self.renderer.source_for(codepoint)
+        if actual_source != expected_source:
+            raise ValueError(
+                f"Source font coverage changed for U+{codepoint:04X}: "
+                f"expected {expected_source}, got {actual_source}"
+            )
+        content = self.renderer.render(codepoint)
+        if content is None:
+            raise ValueError(f"Cannot render source glyph U+{codepoint:04X}")
+        reference = str(Path(item['reference']).resolve())
+        if reference not in self.style_cache:
+            self.style_cache[reference] = _style_image(reference)
+        return {
+            'font_label': 0,
+            'char_label': 0,
+            'style_image': self.style_cache[reference],
+            'content_image': np.asarray(content, dtype=np.uint8).transpose(2, 0, 1),
+            'target_image': None,
+            'unicode_label': codepoint,
+        }
+
+    def close(self):
+        return None
+
+
+def expanded_sample_indices(start_idx, batch_size, num_images, candidates):
+    """Map an expanded/padded batch to base samples without copying image arrays."""
+    expanded = []
+    for expanded_index in range(start_idx, start_idx + batch_size):
+        real_index = min(expanded_index, num_images - 1)
+        expanded.append((real_index // candidates, real_index % candidates))
+    return expanded
 
 
 def main(args):
@@ -273,68 +400,51 @@ def main(args):
     print(f"  Device:          {device}")
     print("=" * 50)
 
-    # ============ Load Test Data ============
-    print(f"Loading test data from {args.test_npz}")
-    test_data = np.load(args.test_npz)
-    font_labels_all = test_data['font_labels']
-    char_labels_all = test_data['char_labels']
-    style_images_all = test_data['style_images']      # (N, 3, 128, 128) uint8
-    content_images_all = test_data['content_images']  # (N, 3, 256, 256) uint8
-
-    # Load target images if needed for pairwise comparison
-    target_images_all = None
-    if args.pairwise == 'target_gen':
-        if 'target_images' in test_data:
-            target_images_all = test_data['target_images']  # (N, 3, 256, 256) uint8
-        else:
-            raise ValueError("target_gen pairwise mode requires 'target_images' in npz file")
-
-    # Load unicode labels if available
-    unicode_labels_all = None
-    if 'unicode_labels' in test_data:
-        unicode_labels_all = test_data['unicode_labels']
-        print(f"Loaded unicode labels, will use U+XXXX filenames")
+    # ============ Load Test Data / Lazy Request ============
+    if args.request_manifest:
+        print(f"Loading generation request from {args.request_manifest}")
+        input_source = ManifestInputSource(args.request_manifest, args.pairwise)
+        request_seed = int(input_source.request.get('seed', args.seed))
+        request_candidates = int(
+            input_source.request.get('candidates', args.num_candidates)
+        )
+        request_checkpoint = Path(
+            input_source.request.get('checkpoint', '')
+        ).resolve()
+        if request_seed != args.seed:
+            raise ValueError(
+                f"Request seed {request_seed} does not match --seed {args.seed}"
+            )
+        if request_candidates != args.num_candidates:
+            raise ValueError(
+                "Request candidate count does not match --num_candidates"
+            )
+        if request_checkpoint != Path(args.checkpoint).resolve():
+            raise ValueError(
+                "Request checkpoint does not match --checkpoint"
+            )
     else:
-        print("unicode_labels not found in npz, using index-based filenames")
+        print(f"Loading test data from {args.test_npz}")
+        input_source = NpzInputSource(args.test_npz, args.pairwise)
+    if input_source.sample(0)['unicode_label'] is not None:
+        print("Loaded unicode labels, will use U+XXXX filenames")
+    else:
+        print("unicode_labels not found, using index-based filenames")
 
-    candidate_ids_all = np.zeros(len(font_labels_all), dtype=np.int64)
+    num_total_samples = input_source.count * args.num_candidates
     if args.num_candidates > 1:
-        original_count = len(font_labels_all)
-        font_labels_all = np.repeat(font_labels_all, args.num_candidates, axis=0)
-        char_labels_all = np.repeat(char_labels_all, args.num_candidates, axis=0)
-        style_images_all = np.repeat(style_images_all, args.num_candidates, axis=0)
-        content_images_all = np.repeat(content_images_all, args.num_candidates, axis=0)
-        if target_images_all is not None:
-            target_images_all = np.repeat(target_images_all, args.num_candidates, axis=0)
-        if unicode_labels_all is not None:
-            unicode_labels_all = np.repeat(unicode_labels_all, args.num_candidates, axis=0)
-        candidate_ids_all = np.tile(np.arange(args.num_candidates, dtype=np.int64), original_count)
         print(
-            f"Expanded {original_count} inputs to {len(font_labels_all)} "
+            f"Mapped {input_source.count} inputs to {num_total_samples} "
             f"samples ({args.num_candidates} candidates each, base seed={args.seed})"
         )
-
-    num_total_samples = len(font_labels_all)
     num_images = args.num_images if args.num_images else num_total_samples
     num_images = min(num_images, num_total_samples)
+    if num_images < 1:
+        raise ValueError("No generation samples are available")
     batch_size = args.batch_size
 
     # Pad to ensure even distribution across GPUs (avoid distributed deadlock)
     padded_num_images = ((num_images + batch_size * world_size - 1) // (batch_size * world_size)) * batch_size * world_size
-    if padded_num_images > num_total_samples:
-        pad_size = padded_num_images - num_total_samples
-        # Pad by repeating last sample (will be discarded during save)
-        font_labels_all = np.concatenate([font_labels_all, np.repeat(font_labels_all[-1:], pad_size, axis=0)])
-        char_labels_all = np.concatenate([char_labels_all, np.repeat(char_labels_all[-1:], pad_size, axis=0)])
-        style_images_all = np.concatenate([style_images_all, np.repeat(style_images_all[-1:], pad_size, axis=0)])
-        content_images_all = np.concatenate([content_images_all, np.repeat(content_images_all[-1:], pad_size, axis=0)])
-        if target_images_all is not None:
-            target_images_all = np.concatenate([target_images_all, np.repeat(target_images_all[-1:], pad_size, axis=0)])
-        if unicode_labels_all is not None:
-            unicode_labels_all = np.concatenate([unicode_labels_all, np.repeat(unicode_labels_all[-1:], pad_size, axis=0)])
-        candidate_ids_all = np.concatenate(
-            [candidate_ids_all, np.repeat(candidate_ids_all[-1:], pad_size, axis=0)]
-        )
 
     num_steps = padded_num_images // (batch_size * world_size)
 
@@ -367,6 +477,7 @@ def main(args):
         print(f"Rank {local_rank}: No images to generate (num_images={num_images}), skipping.")
         if world_size > 1:
             dist.barrier()
+        input_source.close()
         return
 
     for step in range(num_steps):
@@ -381,19 +492,44 @@ def main(args):
 
         print(f"Rank {local_rank}: Generation step {step + 1}/{num_steps}")
 
-        end_idx = start_idx + batch_size
+        # Render/load only the base samples needed by this expanded batch.
+        mapped_indices = expanded_sample_indices(
+            start_idx,
+            batch_size,
+            num_images,
+            args.num_candidates,
+        )
+        sample_cache = {}
+        batch_samples = []
+        for base_index, _candidate_id in mapped_indices:
+            if base_index not in sample_cache:
+                sample_cache[base_index] = input_source.sample(base_index)
+            batch_samples.append(sample_cache[base_index])
+        font_labels_array = np.asarray(
+            [sample['font_label'] for sample in batch_samples],
+            dtype=np.int64,
+        )
+        char_labels_array = np.asarray(
+            [sample['char_label'] for sample in batch_samples],
+            dtype=np.int64,
+        )
+        style_images_array = np.stack(
+            [sample['style_image'] for sample in batch_samples]
+        )
+        content_images_array = np.stack(
+            [sample['content_image'] for sample in batch_samples]
+        )
 
-        # Load batch data
-        font_labels_batch = torch.from_numpy(font_labels_all[start_idx:end_idx]).long().to(device)
-        char_labels_batch = torch.from_numpy(char_labels_all[start_idx:end_idx]).long().to(device)
+        font_labels_batch = torch.from_numpy(font_labels_array).long().to(device)
+        char_labels_batch = torch.from_numpy(char_labels_array).long().to(device)
 
         style_images_batch = torch.from_numpy(
-            style_images_all[start_idx:end_idx].copy()
+            style_images_array.copy()
         ).float().to(device)
         style_images_batch = style_images_batch / 255.0 * 2.0 - 1.0
 
         content_images_batch = torch.from_numpy(
-            content_images_all[start_idx:end_idx].copy()
+            content_images_array.copy()
         ).float().to(device)
         content_images_batch = content_images_batch / 255.0 * 2.0 - 1.0
 
@@ -417,13 +553,15 @@ def main(args):
                 break
 
             # Determine filename
-            font_id = int(font_labels_all[img_id])
-            if unicode_labels_all is not None:
-                filename = f"{font_id:04d}_U+{int(unicode_labels_all[img_id]):04X}"
+            sample = batch_samples[b_id]
+            _base_index, candidate_id = mapped_indices[b_id]
+            font_id = int(sample['font_label'])
+            if sample['unicode_label'] is not None:
+                filename = f"{font_id:04d}_U+{int(sample['unicode_label']):04X}"
             else:
                 filename = f"{font_id:04d}_{img_id:05d}"
             if args.num_candidates > 1:
-                filename += f"_c{int(candidate_ids_all[img_id]):02d}_s{args.seed}"
+                filename += f"_c{candidate_id:02d}_s{args.seed}"
 
             # Convert to uint8 BGR for OpenCV
             gen_img = np.round(np.clip(generated[b_id].numpy().transpose([1, 2, 0]) * 255, 0, 255))
@@ -434,17 +572,56 @@ def main(args):
 
             # Save pairwise comparison if requested
             if args.pairwise == 'src_gen':
-                src_img = content_images_all[img_id].transpose([1, 2, 0])[:, :, ::-1]  # RGB -> BGR
+                src_img = sample['content_image'].transpose([1, 2, 0])[:, :, ::-1]  # RGB -> BGR
                 pair_img = np.concatenate([src_img, gen_img], axis=1)
                 cv2.imwrite(os.path.join(compare_folder, f'{filename}.png'), pair_img)
             elif args.pairwise == 'target_gen':
-                target_img = target_images_all[img_id].transpose([1, 2, 0])[:, :, ::-1]  # RGB -> BGR
+                target_img = sample['target_image'].transpose([1, 2, 0])[:, :, ::-1]  # RGB -> BGR
                 pair_img = np.concatenate([target_img, gen_img], axis=1)
                 cv2.imwrite(os.path.join(compare_folder, f'{filename}.png'), pair_img)
+        if local_rank == 0:
+            current = min((step + 1) * batch_size * world_size, num_images)
+            print(
+                "WEBUI_PROGRESS "
+                + json.dumps(
+                    {
+                        "current": current,
+                        "total": num_images,
+                        "message": f"Generated {current}/{num_images} images",
+                    }
+                ),
+                flush=True,
+            )
 
     if world_size > 1:
         dist.barrier()
 
+    if local_rank == 0 and input_source.request is not None:
+        generated_files = sorted(
+            str(path.relative_to(Path(args.output_dir)))
+            for path in Path(gen_folder).glob("*.png")
+        )
+        result_path = Path(args.output_dir) / "generation-result.json"
+        result_path.write_text(
+            json.dumps(
+                {
+                    "schema_version": 2,
+                    "kind": "zi2zi-generation-result",
+                    "request_id": input_source.request.get("request_id"),
+                    "region": input_source.request.get("region"),
+                    "status": "succeeded",
+                    "checkpoint": str(Path(args.checkpoint).resolve()),
+                    "seed": args.seed,
+                    "candidates": args.num_candidates,
+                    "generated_count": len(generated_files),
+                    "files": generated_files,
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+    input_source.close()
     print(f"Rank {local_rank}: Done! Generated images saved to {gen_folder}")
 
 

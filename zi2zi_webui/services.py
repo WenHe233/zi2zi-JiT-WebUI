@@ -495,15 +495,17 @@ def training_command(
 def generation_command(
     manifest: ProjectManifest,
     storage: Storage,
-    npz_path: str | Path,
+    input_path: str | Path,
     device_id: str,
     *,
     seed: int,
     candidates: int = 1,
     output_name: str | None = None,
+    output_dir: str | Path | None = None,
+    request_manifest: bool = False,
     checkpoint_path: str | Path | None = None,
 ) -> tuple[list[str], Path]:
-    output = (
+    output = Path(output_dir) if output_dir else (
         storage.project_dir(manifest.id)
         / "generation"
         / (output_name or f"seed-{seed}")
@@ -513,8 +515,8 @@ def generation_command(
         str(ROOT / "generate_chars.py"),
         "--checkpoint",
         str(checkpoint_path or manifest.active_checkpoint or manifest.base_model),
-        "--test_npz",
-        str(npz_path),
+        "--request-manifest" if request_manifest else "--test_npz",
+        str(input_path),
         "--output_dir",
         str(output),
         "--device",

@@ -124,6 +124,96 @@ def build_inference_npz(
     return output_path
 
 
+def build_generation_request(
+    codepoints: Iterable[int],
+    source_fonts: str | Path | Iterable[str | Path],
+    reference_paths: Iterable[str | Path],
+    *,
+    project_id: str,
+    request_id: str,
+    region: str,
+    checkpoint: str | Path,
+    seed: int = 42,
+    candidates: int = 1,
+    resolution: int = 256,
+) -> dict:
+    """Validate and describe a lazily rendered WebUI generation request."""
+    unique_codepoints = list(dict.fromkeys(int(value) for value in codepoints))
+    if not unique_codepoints:
+        raise ValueError(f"No characters were selected for region {region}")
+    if not 1 <= int(candidates) <= 8:
+        raise ValueError("Candidates per glyph must be between 1 and 8")
+    if isinstance(source_fonts, (str, Path)):
+        source_fonts = [source_fonts]
+    source_paths = [Path(item).resolve() for item in source_fonts]
+    if not source_paths:
+        raise ValueError(f"No source font is configured for region {region}")
+    reference_paths = [Path(item).resolve() for item in reference_paths]
+    if len(reference_paths) < 8:
+        raise ValueError("At least 8 style reference images are required")
+    reference_strings = [str(path) for path in reference_paths]
+    for reference in reference_paths:
+        try:
+            _style_image(reference)
+        except (OSError, ValueError) as exc:
+            raise ValueError(f"Unreadable style reference: {reference}") from exc
+    checkpoint_path = Path(checkpoint).resolve()
+    if not checkpoint_path.is_file():
+        raise ValueError(f"Generation checkpoint not found: {checkpoint_path}")
+
+    renderer = GlyphRendererPool(source_paths, resolution)
+    samples = []
+    missing = []
+    for codepoint in unique_codepoints:
+        source = renderer.source_for(codepoint)
+        if source is None:
+            missing.append(codepoint)
+            continue
+        reference = Path(
+            select_reference(reference_strings, codepoint, seed)
+        )
+        samples.append(
+            {
+                "codepoint": f"U+{codepoint:04X}",
+                "source_font": str(source),
+                "reference": str(reference),
+            }
+        )
+    if missing:
+        examples = ", ".join(f"U+{value:04X}" for value in missing[:12])
+        raise ValueError(
+            f"Source fonts for region {region} cannot render {len(missing)} requested "
+            f"glyph(s): {examples}"
+        )
+    return {
+        "schema_version": 2,
+        "kind": "zi2zi-generation-request",
+        "project_id": project_id,
+        "request_id": request_id,
+        "region": region,
+        "checkpoint": str(checkpoint_path),
+        "seed": int(seed),
+        "candidates": int(candidates),
+        "resolution": int(resolution),
+        "source_fonts": [str(path) for path in renderer.font_paths],
+        "style_references": [str(path) for path in reference_paths],
+        "count": len(samples),
+        "samples": samples,
+    }
+
+
+def write_generation_request(payload: dict, output_path: str | Path) -> Path:
+    output = Path(output_path)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    temporary = output.with_suffix(output.suffix + ".tmp")
+    temporary.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    temporary.replace(output)
+    return output
+
+
 def choose_diverse_references(paths: Iterable[str | Path], count: int = 8) -> list[str]:
     scored = []
     for item in paths:

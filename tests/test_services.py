@@ -257,6 +257,21 @@ def test_generation_checkpoints_prefer_latest_run_best_ssim(tmp_path):
     )
     assert command[command.index("--checkpoint") + 1] == preferred
 
+    request_command, request_output = generation_command(
+        project,
+        storage,
+        tmp_path / "request.json",
+        "0",
+        seed=42,
+        candidates=4,
+        output_dir=tmp_path / "request-output",
+        request_manifest=True,
+        checkpoint_path=preferred,
+    )
+    assert "--request-manifest" in request_command
+    assert "--test_npz" not in request_command
+    assert request_output == tmp_path / "request-output"
+
 
 def test_generation_checkpoint_rejects_paths_outside_project_catalog(tmp_path):
     storage = Storage(tmp_path / "state")
