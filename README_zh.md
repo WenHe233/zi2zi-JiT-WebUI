@@ -111,6 +111,10 @@ PyTorch checkpoint 在加载时可能执行代码，因此本地模型导入必�
 OpenType 表，只追加生成的缺失字形；目前不能以 CFF 轮廓 OTF 或可变字体作为增量
 底稿，也不会从源字体复制轮廓来填补缺字。
 
+生成页会列出每个训练 run 的 `best-SSIM`、`best-LPIPS` 和 `last` LoRA
+checkpoint，并同时保留基础模型选项。首次默认推荐最新 run 的 `best-SSIM`，
+之后会记住所选模型，实际选择也会写入 `generation-plan.json`。
+
 新增字形可使用正文比例字宽或 2:1 中西文指标，PNG、可编辑 SVG、字符/seed 清单、
 训练报告和字体质量报告会随合并后的 TTF 一起打包。发布前必须确认目标字体许可证
 允许修改和再分发。

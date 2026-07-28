@@ -4,9 +4,13 @@ from zi2zi_webui.services import (
     dataset_max_chars_per_font,
     dataset_command,
     dataset_size_preset,
+    generation_checkpoint_options,
+    generation_command,
     infer_checkpoint_model,
+    resolve_generation_checkpoint,
     resolve_training_dataset,
 )
+from zi2zi_webui.models import TrainingRun
 from zi2zi_webui.storage import Storage
 from util.training_schedule import periodic_or_final
 
@@ -98,3 +102,59 @@ def test_dataset_size_presets_and_generated_sample_count(tmp_path):
     metadata.parent.mkdir(parents=True)
     metadata.write_text('{"extracted_count": 2875}', encoding="utf-8")
     assert dataset_max_chars_per_font(dataset) == 2875
+
+
+def test_generation_checkpoints_prefer_latest_run_best_ssim(tmp_path):
+    storage = Storage(tmp_path / "state")
+    project = storage.create_project("LoRA")
+    base = storage.models_dir / "base.pth"
+    base.touch()
+    project.base_model = str(base)
+    project.active_checkpoint = str(base)
+    storage.save_project(project)
+
+    older = TrainingRun(project_id=project.id, parameters={})
+    storage.save_training_run(older)
+    older_dir = storage.project_dir(project.id) / "training" / older.id
+    older_dir.mkdir(parents=True)
+    (older_dir / "checkpoint-best-ssim.pth").touch()
+
+    latest = TrainingRun(project_id=project.id, parameters={})
+    storage.save_training_run(latest)
+    latest_dir = storage.project_dir(project.id) / "training" / latest.id
+    latest_dir.mkdir(parents=True)
+    best_ssim = latest_dir / "checkpoint-best-ssim.pth"
+    best_lpips = latest_dir / "checkpoint-best-lpips.pth"
+    last = latest_dir / "checkpoint-last.pth"
+    for checkpoint in (best_ssim, best_lpips, last):
+        checkpoint.touch()
+
+    choices, preferred = generation_checkpoint_options(project, storage)
+    values = [value for _label, value in choices]
+    assert values[:3] == [
+        str(best_ssim.resolve()),
+        str(best_lpips.resolve()),
+        str(last.resolve()),
+    ]
+    assert preferred == str(best_ssim.resolve())
+    assert resolve_generation_checkpoint(project, storage, preferred) == preferred
+
+    command, _output = generation_command(
+        project,
+        storage,
+        tmp_path / "request.npz",
+        "0",
+        seed=42,
+        checkpoint_path=preferred,
+    )
+    assert command[command.index("--checkpoint") + 1] == preferred
+
+
+def test_generation_checkpoint_rejects_paths_outside_project_catalog(tmp_path):
+    storage = Storage(tmp_path / "state")
+    project = storage.create_project("LoRA")
+    outside = tmp_path / "untrusted.pth"
+    outside.touch()
+
+    with pytest.raises(ValueError, match="does not belong"):
+        resolve_generation_checkpoint(project, storage, outside)

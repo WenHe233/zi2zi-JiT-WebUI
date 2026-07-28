@@ -1,5 +1,6 @@
 from zi2zi_webui.app import build_app, training_snapshot_items
 from zi2zi_webui.jobs import JobManager
+from zi2zi_webui.models import TrainingRun
 from zi2zi_webui.storage import Storage
 
 
@@ -110,5 +111,39 @@ def test_project_page_has_confirmed_danger_zone_deletion(tmp_path):
         )
         assert delete_button.variant == "stop"
         assert confirmation.value is False
+    finally:
+        jobs.stop()
+
+
+def test_generation_page_has_dynamic_lora_checkpoint_selector(tmp_path):
+    storage = Storage(tmp_path / "state")
+    project = storage.create_project("LoRA")
+    base = storage.models_dir / "base.pth"
+    base.touch()
+    project.base_model = str(base)
+    project.active_checkpoint = str(base)
+    storage.save_project(project)
+    run = TrainingRun(project_id=project.id, parameters={})
+    storage.save_training_run(run)
+    run_dir = storage.project_dir(project.id) / "training" / run.id
+    run_dir.mkdir(parents=True)
+    best = run_dir / "checkpoint-best-ssim.pth"
+    best.touch()
+    jobs = JobManager(storage)
+    try:
+        app = build_app(storage, jobs, language="en")
+        selector = next(
+            block
+            for block in app.blocks.values()
+            if getattr(block, "label", "")
+            == "Generation model (LoRA / checkpoint)"
+        )
+        assert selector.allow_custom_value
+        assert selector.value == str(best.resolve())
+        assert any(
+            value == str(best.resolve())
+            for _label, value in selector.choices
+        )
+        assert selector.preprocess("restored-checkpoint.pth") == "restored-checkpoint.pth"
     finally:
         jobs.stop()

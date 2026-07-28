@@ -149,6 +149,11 @@ tables, and appends only generated missing glyphs. CFF-outline OTF and variable
 fonts cannot currently be incremental bases. Source-font outlines are never
 copied as fallback content.
 
+The generation page lists LoRA checkpoints from each training run (`best-SSIM`,
+`best-LPIPS`, and `last`) alongside the base model. The newest run's best-SSIM
+checkpoint is initially recommended, later selections are remembered, and the
+exact selection is recorded in `generation-plan.json`.
+
 Generated PNGs remain traceable to editable SVGs. The exporter offers
 proportional Latin metrics or a 2:1 CJK/Latin profile for added glyphs and
 creates a ZIP containing the merged TTF, selected PNGs, SVGs, manifests,

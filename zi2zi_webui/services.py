@@ -25,6 +25,11 @@ DATASET_SIZE_PRESETS = {
     "balanced": (3000, 64),
     "coverage": (6000, 128),
 }
+GENERATION_CHECKPOINTS = (
+    ("checkpoint-best-ssim.pth", "best SSIM"),
+    ("checkpoint-best-lpips.pth", "best LPIPS"),
+    ("checkpoint-last.pth", "last"),
+)
 
 
 def dataset_size_preset(name: str) -> tuple[int, int]:
@@ -453,6 +458,7 @@ def generation_command(
     seed: int,
     candidates: int = 1,
     output_name: str | None = None,
+    checkpoint_path: str | Path | None = None,
 ) -> tuple[list[str], Path]:
     output = (
         storage.project_dir(manifest.id)
@@ -463,7 +469,7 @@ def generation_command(
         sys.executable,
         str(ROOT / "generate_chars.py"),
         "--checkpoint",
-        manifest.active_checkpoint or manifest.base_model,
+        str(checkpoint_path or manifest.active_checkpoint or manifest.base_model),
         "--test_npz",
         str(npz_path),
         "--output_dir",
@@ -478,3 +484,75 @@ def generation_command(
         str(candidates),
     ]
     return command, output
+
+
+def generation_checkpoint_options(
+    manifest: ProjectManifest,
+    storage: Storage,
+) -> tuple[list[tuple[str, str]], str | None]:
+    """Return project-owned inference checkpoints and the recommended selection."""
+    options: list[tuple[str, str]] = []
+    seen: set[Path] = set()
+    training_paths: list[Path] = []
+
+    for run in storage.list_training_runs(manifest.id):
+        run_id = str(run["id"])
+        run_dir = storage.project_dir(manifest.id) / "training" / run_id
+        for filename, kind in GENERATION_CHECKPOINTS:
+            checkpoint = (run_dir / filename).resolve()
+            if not checkpoint.is_file() or checkpoint in seen:
+                continue
+            options.append(
+                (
+                    f"LoRA · run {run_id[:8]} · {kind}",
+                    str(checkpoint),
+                )
+            )
+            seen.add(checkpoint)
+            training_paths.append(checkpoint)
+
+    active = (
+        Path(manifest.active_checkpoint).resolve()
+        if manifest.active_checkpoint
+        else None
+    )
+    base = Path(manifest.base_model).resolve() if manifest.base_model else None
+    if active and active.is_file() and active not in seen and active != base:
+        options.append((f"Active checkpoint · {active.name}", str(active)))
+        seen.add(active)
+    if base and base.is_file() and base not in seen:
+        options.append((f"Base model · {base.name}", str(base)))
+        seen.add(base)
+
+    if active and active.is_file() and active != base:
+        preferred = active
+    elif training_paths:
+        preferred = training_paths[0]
+    elif base and base.is_file():
+        preferred = base
+    elif active and active.is_file():
+        preferred = active
+    else:
+        preferred = None
+    return options, str(preferred) if preferred else None
+
+
+def resolve_generation_checkpoint(
+    manifest: ProjectManifest,
+    storage: Storage,
+    selected: str | Path | None,
+) -> str:
+    options, preferred = generation_checkpoint_options(manifest, storage)
+    requested = Path(selected or preferred or "").resolve()
+    allowed = {Path(value).resolve() for _label, value in options}
+    if not str(selected or preferred or "").strip():
+        raise ValueError(
+            "No generation checkpoint is available. Attach a base model or finish LoRA training."
+        )
+    if requested not in allowed:
+        raise ValueError(
+            "The selected checkpoint is unavailable or does not belong to this project."
+        )
+    if not requested.is_file():
+        raise ValueError(f"Generation checkpoint not found: {requested}")
+    return str(requested)

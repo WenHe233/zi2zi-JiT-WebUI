@@ -34,9 +34,11 @@ from .services import (
     dataset_size_preset,
     font_dataset_capacity,
     generation_command,
+    generation_checkpoint_options,
     import_model,
     infer_checkpoint_model,
     queue_official_model_download,
+    resolve_generation_checkpoint,
     resolve_training_dataset,
     training_command,
 )
@@ -441,6 +443,13 @@ def build_app(
         ]
         return gr.update(choices=choices, value=[item[1] for item in choices[:1]])
 
+    def generation_checkpoint_choices(project_id):
+        if not project_id:
+            return gr.update(choices=[], value=None)
+        project = storage.get_project(project_id)
+        choices, preferred = generation_checkpoint_options(project, storage)
+        return gr.update(choices=choices, value=preferred)
+
     def refresh_charts(project_id, run_ids):
         runs = project_runs(project_id)
         selected = [item for item in runs if item["id"] in (run_ids or [])][:5]
@@ -529,11 +538,20 @@ def build_app(
         split_regions,
         primary_region,
         device,
+        generation_checkpoint,
         seed,
         candidates,
         allow_large_candidates,
     ):
         project = storage.get_project(project_id)
+        try:
+            selected_checkpoint = resolve_generation_checkpoint(
+                project,
+                storage,
+                generation_checkpoint,
+            )
+        except ValueError as exc:
+            raise gr.Error(str(exc)) from exc
         requested_codepoints, increments = resolve_selection(
             preset_ids or [],
             custom_text=text or "",
@@ -571,6 +589,7 @@ def build_app(
                         if project.input_mode == "font" and project.target_assets
                         else ""
                     ),
+                    "checkpoint": selected_checkpoint,
                     "requested_count": len(requested_codepoints),
                     "skipped_existing_count": len(skipped_existing),
                     "generation_count": len(codepoints),
@@ -645,6 +664,7 @@ def build_app(
                 seed=int(seed),
                 candidates=int(candidates),
                 output_name=f"{request_id}-{region}-seed-{int(seed)}",
+                checkpoint_path=selected_checkpoint,
             )
             outputs.append(output)
             job_ids.append(
@@ -662,12 +682,16 @@ def build_app(
             if fallbacks
             else ""
         )
+        project.active_checkpoint = selected_checkpoint
+        project.inference["checkpoint"] = selected_checkpoint
+        storage.save_project(project)
         return (
             "\n".join(str(item) for item in outputs),
             (
                 f"Queued {len(codepoints)} missing glyphs in {len(job_ids)} regional job(s): "
                 f"{', '.join(job_ids)}. Skipped {len(skipped_existing)} glyphs already "
-                f"present in the target font.{warning}"
+                f"present in the target font. Checkpoint: {Path(selected_checkpoint).name}."
+                f"{warning}"
             ),
         )
 
@@ -918,6 +942,18 @@ def build_app(
             f"dataset {dataset}{safety_note}"
         )
 
+    initial_project_choices = project_choices()
+    initial_project_id = (
+        initial_project_choices[0][1] if initial_project_choices else None
+    )
+    if initial_project_id:
+        initial_project = storage.get_project(initial_project_id)
+        initial_checkpoint_choices, initial_checkpoint = (
+            generation_checkpoint_options(initial_project, storage)
+        )
+    else:
+        initial_checkpoint_choices, initial_checkpoint = [], None
+
     with gr.Blocks(title=t("app_title"), theme=gr.themes.Soft()) as app:
         gr.Markdown(
             f"# {t('app_title')}\n"
@@ -926,7 +962,10 @@ def build_app(
         )
         with gr.Row():
             project_selector = gr.Dropdown(
-                choices=project_choices(), label=t("projects"), scale=5
+                choices=initial_project_choices,
+                value=initial_project_id,
+                label=t("projects"),
+                scale=5,
             )
             refresh_projects_btn = gr.Button(t("refresh"), scale=1)
             language_display = gr.Dropdown(
@@ -1233,6 +1272,26 @@ def build_app(
                     label=b("拉丁、符号和自定义文本的主地区", "Primary region for Latin, symbols, and custom text"),
                 )
             with gr.Row():
+                generation_checkpoint = gr.Dropdown(
+                    choices=initial_checkpoint_choices,
+                    value=initial_checkpoint,
+                    label=b(
+                        "生成模型（LoRA / checkpoint）",
+                        "Generation model (LoRA / checkpoint)",
+                    ),
+                    info=b(
+                        "首次默认推荐最新训练 run 的 best-SSIM，之后记住所选模型；"
+                        "也可选择 best-LPIPS、last 或基础模型。",
+                        "The latest run's best-SSIM is initially recommended and later "
+                        "selections are remembered; best-LPIPS, last, and the base model "
+                        "remain selectable.",
+                    ),
+                    allow_custom_value=True,
+                )
+                refresh_generation_checkpoints_btn = gr.Button(
+                    b("刷新训练模型", "Refresh trained models")
+                )
+            with gr.Row():
                 generation_device = gr.Dropdown(
                     choices=device_choices, value=device_choices[0][1], label=b("设备", "Device")
                 )
@@ -1328,6 +1387,11 @@ def build_app(
         project_selector.change(project_dataset_path, project_selector, dataset_path)
         project_selector.change(run_choices, project_selector, run_selector)
         project_selector.change(
+            generation_checkpoint_choices,
+            project_selector,
+            generation_checkpoint,
+        )
+        project_selector.change(
             lambda: False,
             outputs=confirm_delete_project,
         )
@@ -1379,6 +1443,11 @@ def build_app(
             [run_selector, training_status],
         )
         refresh_runs_btn.click(run_choices, project_selector, run_selector)
+        refresh_generation_checkpoints_btn.click(
+            generation_checkpoint_choices,
+            project_selector,
+            generation_checkpoint,
+        )
         refresh_charts_btn.click(
             refresh_charts,
             [project_selector, run_selector],
@@ -1423,6 +1492,7 @@ def build_app(
                 split_regions,
                 primary_region,
                 generation_device,
+                generation_checkpoint,
                 generation_seed,
                 candidate_count,
                 unlock_candidates,
