@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import html
+import re
+import shutil
 import sys
 from pathlib import Path
 from typing import Any
@@ -44,6 +46,7 @@ from .presets import (
     resolve_selection_by_region,
     write_selection_manifest,
 )
+from .project_packages import inspect_project_package
 from .services import (
     ROOT,
     clamp_training_retry_command,
@@ -190,6 +193,167 @@ def build_app(
         if not project_id:
             return "{}"
         return json.dumps(storage.get_project(project_id).to_dict(), ensure_ascii=False, indent=2)
+
+    def project_export_packages():
+        export_root = storage.root / "project-exports"
+        export_root.mkdir(parents=True, exist_ok=True)
+        return [
+            str(path)
+            for path in sorted(
+                export_root.glob("*.zi2zi-project.zip"),
+                key=lambda item: item.stat().st_mtime_ns,
+                reverse=True,
+            )
+        ]
+
+    def queue_project_export(project_id, mode, include_shared_models):
+        if not project_id:
+            raise gr.Error(b("请先选择项目", "Select a project first"))
+        project = storage.get_project(project_id)
+        safe_name = re.sub(r"[^\w.-]+", "-", project.name, flags=re.UNICODE).strip(".-")
+        safe_name = safe_name[:80] or "project"
+        export_root = storage.root / "project-exports"
+        export_root.mkdir(parents=True, exist_ok=True)
+        output = (
+            export_root
+            / f"{safe_name}-{project.id[:8]}-{uuid4().hex[:8]}-{mode}.zi2zi-project.zip"
+        )
+        command = [
+            sys.executable,
+            str(ROOT / "scripts" / "project_package.py"),
+            "export",
+            "--data-dir",
+            str(storage.root),
+            "--project-id",
+            project.id,
+            "--output",
+            str(output),
+            "--mode",
+            str(mode),
+        ]
+        if include_shared_models:
+            command.append("--include-shared-models")
+        job_id = jobs.submit(
+            "project_export",
+            command,
+            project_id=project.id,
+            cwd=ROOT,
+        )
+        return (
+            str(output),
+            b(
+                f"项目导出任务已进入队列：{job_id}。完成后点击“刷新可下载项目包”。",
+                f"Project export queued as {job_id}. Click “Refresh downloadable packages” "
+                "after it completes.",
+            ),
+        )
+
+    def preview_project_import(package_path):
+        if not package_path:
+            raise gr.Error(b("请选择项目包", "Choose a project package"))
+        path = Path(package_path).resolve()
+        try:
+            inspection = inspect_project_package(path)
+        except (FileNotFoundError, OSError, ValueError) as exc:
+            raise gr.Error(
+                f"{b('项目包预检失败', 'Project package preflight failed')}: {exc}"
+            ) from exc
+        size_mb = inspection["package_size"] / 1024**2
+        unpacked_mb = inspection["uncompressed_bytes"] / 1024**2
+        models = inspection.get("models") or []
+        included_models = sum(bool(item.get("included")) for item in models)
+        external_count = len(inspection.get("external_references") or [])
+        mode_label = b(
+            "轻量" if inspection["export_mode"] == "lightweight" else "完整",
+            "Lightweight" if inspection["export_mode"] == "lightweight" else "Full",
+        )
+        import_warning = b(
+            "导入将创建新的项目 UUID，不会覆盖或合并现有项目。"
+            "轻量包需要重新挂接未包含的字体、数据集和模型。"
+            "包内 checkpoint 在使用前仍需重新校验。",
+            "Import creates a new project UUID and never overwrites or merges an "
+            "existing project. Lightweight packages require omitted fonts, datasets, "
+            "and models to be reattached. Packaged checkpoints still require validation.",
+        )
+        summary = (
+            f"### {b('项目包预检通过', 'Project package preflight passed')}\n\n"
+            f"- {b('项目', 'Project')}: **{inspection['project_name']}**\n"
+            f"- {b('模式', 'Mode')}: {mode_label}\n"
+            f"- {b('压缩包 / 解压后大小', 'Package / unpacked size')}: "
+            f"{size_mb:.1f} MB / {unpacked_mb:.1f} MB\n"
+            f"- {b('文件', 'Files')}: {inspection['archive_file_count']}; "
+            f"{b('训练 run', 'training runs')}: {inspection['training_run_count']}; "
+            f"{b('任务记录', 'job records')}: {inspection['job_count']}\n"
+            f"- {b('模型引用 / 已包含', 'Model references / included')}: "
+            f"{len(models)} / {included_models}\n"
+            f"- {b('外部路径引用', 'External path references')}: {external_count}\n"
+            f"- SHA-256: ✅ {b('全部文件校验通过', 'all package members verified')}\n\n"
+            f"⚠️ {import_warning}"
+        )
+        stat_result = path.stat()
+        token = {
+            "path": str(path),
+            "size": stat_result.st_size,
+            "mtime_ns": stat_result.st_mtime_ns,
+        }
+        return summary, token, False
+
+    def queue_project_import(package_path, preflight, confirmed):
+        if not package_path or not isinstance(preflight, dict):
+            raise gr.Error(
+                b("请先完成项目包预检", "Run project package preflight first")
+            )
+        if not confirmed:
+            raise gr.Error(
+                b("请确认以新项目导入", "Confirm import as a new project")
+            )
+        source = Path(package_path).resolve()
+        try:
+            current = source.stat()
+        except OSError as exc:
+            raise gr.Error(
+                f"{b('无法读取项目包', 'Cannot read project package')}: {exc}"
+            ) from exc
+        if (
+            str(source) != str(preflight.get("path"))
+            or current.st_size != preflight.get("size")
+            or current.st_mtime_ns != preflight.get("mtime_ns")
+        ):
+            raise gr.Error(
+                b(
+                    "项目包在预检后发生变化，请重新预检",
+                    "The package changed after preflight; inspect it again",
+                )
+            )
+        incoming = storage.root / "imports"
+        incoming.mkdir(parents=True, exist_ok=True)
+        staged = incoming / f"{uuid4().hex}.zi2zi-project.zip"
+        try:
+            shutil.copy2(source, staged)
+        except OSError as exc:
+            raise gr.Error(
+                f"{b('暂存项目包失败', 'Failed to stage project package')}: {exc}"
+            ) from exc
+        command = [
+            sys.executable,
+            str(ROOT / "scripts" / "project_package.py"),
+            "import",
+            "--data-dir",
+            str(storage.root),
+            "--package",
+            str(staged),
+            "--delete-package-after",
+        ]
+        job_id = jobs.submit("project_import", command, cwd=ROOT)
+        return (
+            b(
+                f"项目导入任务已进入队列：{job_id}。完成后刷新项目列表，"
+                "并根据任务日志重新挂接缺失素材或模型。",
+                f"Project import queued as {job_id}. Refresh the project list after completion, "
+                "then use the task log to reattach any missing assets or models.",
+            ),
+            False,
+        )
 
     def save_assets(
         project_id,
@@ -1409,6 +1573,85 @@ def build_app(
                 f"**{b('数据根目录', 'Data root')}:** `{storage.root}` · "
                 f"**{b('磁盘可用', 'Free disk')}:** {disk_free_gb(storage.root)} GB"
             )
+            with gr.Accordion(b("项目导入与导出", "Project import and export"), open=False):
+                gr.Markdown(
+                    b(
+                        "轻量包保存配置、记录、指标和报告；完整包额外保存项目目录中的"
+                        "素材、数据集、checkpoint、生成结果、字体和日志。共享模型默认"
+                        "仅记录 SHA-256 引用，勾选后才会放入完整包。导出前必须先结束"
+                        "该项目的训练、生成等活动任务。",
+                        "Lightweight packages preserve configuration, records, metrics, and "
+                        "reports. Full packages also preserve project assets, datasets, "
+                        "checkpoints, generated results, fonts, and logs. Shared models are "
+                        "referenced by SHA-256 unless explicitly included. Finish active "
+                        "training or generation jobs before exporting.",
+                    )
+                )
+                with gr.Row():
+                    project_export_mode = gr.Radio(
+                        choices=[
+                            (b("轻量", "Lightweight"), "lightweight"),
+                            (b("完整备份", "Full backup"), "full"),
+                        ],
+                        value="lightweight",
+                        label=b("导出模式", "Export mode"),
+                    )
+                    include_export_models = gr.Checkbox(
+                        value=False,
+                        label=b(
+                            "包含共享基础模型（可能非常大）",
+                            "Include shared base models (may be very large)",
+                        ),
+                    )
+                    export_project_btn = gr.Button(
+                        b("导出当前项目", "Export current project"),
+                        variant="primary",
+                    )
+                project_export_output = gr.Textbox(
+                    label=b("预计项目包路径", "Expected package path"),
+                    interactive=False,
+                )
+                project_export_status = gr.Markdown()
+                refresh_project_packages_btn = gr.Button(
+                    b("刷新可下载项目包", "Refresh downloadable packages")
+                )
+                downloadable_project_packages = gr.File(
+                    value=project_export_packages(),
+                    label=b("可下载项目包", "Downloadable project packages"),
+                    file_count="multiple",
+                    interactive=False,
+                )
+                gr.Markdown(
+                    b(
+                        "导入采用两步确认：先校验结构、路径和全部 SHA-256，再作为新项目"
+                        "进入任务队列。不会覆盖或合并当前项目。",
+                        "Import uses two-step confirmation: first validate structure, paths, "
+                        "and every SHA-256 checksum, then queue it as a new project. Existing "
+                        "projects are never overwritten or merged.",
+                    )
+                )
+                project_import_file = gr.File(
+                    label=b("项目包", "Project package"),
+                    file_types=[".zip"],
+                    type="filepath",
+                )
+                preview_project_import_btn = gr.Button(
+                    b("预检项目包", "Inspect project package")
+                )
+                project_import_preview = gr.Markdown()
+                project_import_preflight = gr.State({})
+                confirm_project_import = gr.Checkbox(
+                    value=False,
+                    label=b(
+                        "确认作为新项目导入",
+                        "Confirm import as a new project",
+                    ),
+                )
+                import_project_btn = gr.Button(
+                    b("开始导入", "Start import"),
+                    variant="primary",
+                )
+                project_import_status = gr.Markdown()
             with gr.Accordion(b("危险操作", "Danger zone"), open=False):
                 gr.Markdown(
                     b(
@@ -1808,6 +2051,45 @@ def build_app(
 
         create_project_btn.click(
             create_project, new_project_name, [project_selector, project_status]
+        )
+        export_project_btn.click(
+            queue_project_export,
+            [
+                project_selector,
+                project_export_mode,
+                include_export_models,
+            ],
+            [project_export_output, project_export_status],
+        )
+        refresh_project_packages_btn.click(
+            project_export_packages,
+            outputs=downloadable_project_packages,
+        )
+        preview_project_import_btn.click(
+            preview_project_import,
+            project_import_file,
+            [
+                project_import_preview,
+                project_import_preflight,
+                confirm_project_import,
+            ],
+        )
+        project_import_file.change(
+            lambda: ({}, False, ""),
+            outputs=[
+                project_import_preflight,
+                confirm_project_import,
+                project_import_preview,
+            ],
+        )
+        import_project_btn.click(
+            queue_project_import,
+            [
+                project_import_file,
+                project_import_preflight,
+                confirm_project_import,
+            ],
+            [project_import_status, confirm_project_import],
         )
         delete_project_btn.click(
             delete_project_action,

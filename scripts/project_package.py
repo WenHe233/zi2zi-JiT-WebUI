@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+from pathlib import Path
 
 from zi2zi_webui.project_packages import (
     export_project_package,
@@ -44,6 +45,7 @@ def parser() -> argparse.ArgumentParser:
     import_command = commands.add_parser("import")
     import_command.add_argument("--data-dir", required=True)
     import_command.add_argument("--package", required=True)
+    import_command.add_argument("--delete-package-after", action="store_true")
     return root
 
 
@@ -61,11 +63,15 @@ def main() -> None:
             progress=emit_progress,
         )
     else:
-        result = import_project_package(
-            Storage(args.data_dir),
-            args.package,
-            progress=emit_progress,
-        )
+        try:
+            result = import_project_package(
+                Storage(args.data_dir),
+                args.package,
+                progress=emit_progress,
+            )
+        finally:
+            if args.delete_package_after:
+                Path(args.package).unlink(missing_ok=True)
     print(json.dumps(result, ensure_ascii=False, indent=2), flush=True)
 
 

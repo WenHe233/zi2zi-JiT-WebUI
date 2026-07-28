@@ -146,6 +146,8 @@ def test_lightweight_package_excludes_binary_assets(tmp_path):
     restored = target.get_project(imported["project_id"])
     assert restored.global_source_fonts == []
     assert restored.target_assets == []
+    restored_run = target.list_training_runs(restored.id)[0]
+    assert restored_run["parameters"]["dataset_path"] == ""
     assert imported["missing_project_references"]
 
 
@@ -229,6 +231,25 @@ def test_export_rejects_active_project_jobs(tmp_path):
 
     with pytest.raises(ValueError, match="active"):
         export_project_package(storage, project.id, tmp_path / "busy.zip")
+
+
+def test_export_job_itself_does_not_block_queued_export(tmp_path):
+    storage = Storage(tmp_path / "state")
+    project = storage.create_project("Exporting")
+    with storage._connect() as db:
+        db.execute(
+            """
+            INSERT INTO jobs(
+                id, project_id, job_type, status, command_json, cwd, gpu,
+                env_json, log_path, created_at
+            ) VALUES ('export-job', ?, 'project_export', 'running', '[]', '.', NULL,
+                      '{}', 'export.log', 'now')
+            """,
+            (project.id,),
+        )
+
+    result = export_project_package(storage, project.id, tmp_path / "export.zip")
+    assert Path(result["package_path"]).is_file()
 
 
 def test_import_rolls_back_new_project_files_when_database_insert_fails(

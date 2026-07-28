@@ -84,6 +84,29 @@ all of its assets, datasets, training runs, checkpoints, generated results,
 fonts, and job records. Shared models are retained. Explicit confirmation is
 required, and queued or running project jobs must be cancelled first.
 
+The Projects page can also export versioned `.zi2zi-project.zip` packages.
+Lightweight packages contain configuration, run/job records, metrics, review
+metadata, and reports; full packages additionally contain project assets,
+datasets, checkpoints, generated glyphs, fonts, and logs. Shared base models
+are referenced by SHA-256 by default and are included only when explicitly
+selected. Import first verifies canonical paths and every packaged SHA-256,
+then creates a new project UUID without overwriting or merging existing
+projects. PyTorch checkpoints are copied without being loaded, and imported
+checkpoint sidecars are not trusted until background validation succeeds.
+Confirm that you have permission to redistribute every included font, model,
+and training asset.
+
+The same workflow is available from the CLI:
+
+```bash
+python scripts/project_package.py export \
+  --data-dir webui_data --project-id <uuid> \
+  --output backup.zi2zi-project.zip --mode full
+python scripts/project_package.py inspect --package backup.zi2zi-project.zip
+python scripts/project_package.py import \
+  --data-dir webui_data --package backup.zi2zi-project.zip
+```
+
 #### Source font collections
 
 The global source and each SC/TC/JP/KR source can be an ordered collection of

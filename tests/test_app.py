@@ -208,3 +208,30 @@ def test_live_monitors_use_stable_selection_and_paused_ten_second_charts(tmp_pat
         assert 10 in timer_values
     finally:
         jobs.stop()
+
+
+def test_project_page_exposes_safe_package_import_and_export(tmp_path):
+    storage = Storage(tmp_path / "state")
+    storage.create_project("Portable")
+    jobs = JobManager(storage)
+    try:
+        app = build_app(storage, jobs, language="en")
+        labelled = {
+            getattr(block, "label", ""): block
+            for block in app.blocks.values()
+            if getattr(block, "label", "")
+        }
+        values = {
+            getattr(block, "value", "")
+            for block in app.blocks.values()
+            if isinstance(getattr(block, "value", ""), str)
+        }
+        assert labelled["Export mode"].value == "lightweight"
+        assert labelled["Include shared base models (may be very large)"].value is False
+        assert labelled["Confirm import as a new project"].value is False
+        assert labelled["Project package"].type == "filepath"
+        assert "Export current project" in values
+        assert "Inspect project package" in values
+        assert "Start import" in values
+    finally:
+        jobs.stop()

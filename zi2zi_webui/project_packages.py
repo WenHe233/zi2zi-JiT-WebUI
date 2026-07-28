@@ -300,6 +300,7 @@ def export_project_package(
             """
             SELECT id FROM jobs
             WHERE project_id=? AND status IN ('queued', 'running')
+              AND job_type != 'project_export'
             ORDER BY created_at
             """,
             (project_id,),
@@ -838,6 +839,19 @@ def import_project_package(
             staged_project,
             {path for path in model_paths.values() if path},
         )
+        planned_model_paths = {path for path in model_paths.values() if path}
+
+        def imported_path_available(raw_path: Any) -> bool:
+            text = str(raw_path or "")
+            if not text:
+                return False
+            path = Path(text).resolve()
+            try:
+                relative = path.relative_to(final_project)
+            except ValueError:
+                return path.exists() or str(path) in planned_model_paths
+            return (staged_project / relative).exists()
+
         manifest = ProjectManifest.from_dict(restored_project)
         manifest.id = new_project_id
 
@@ -863,7 +877,22 @@ def import_project_package(
             parameters = dict(restored.get("parameters") or {})
             if parameters.get("job_id"):
                 parameters["job_id"] = job_ids.get(str(parameters["job_id"]), "")
+            if (
+                parameters.get("dataset_path")
+                and not imported_path_available(parameters["dataset_path"])
+            ):
+                missing_project_references.append(str(parameters["dataset_path"]))
+                parameters["dataset_path"] = ""
             restored["parameters"] = parameters
+            for key in ("metrics_path", "tensorboard_path"):
+                if restored.get(key) and not imported_path_available(restored[key]):
+                    missing_project_references.append(str(restored[key]))
+                    restored[key] = ""
+            restored["checkpoint_paths"] = {
+                key: path
+                for key, path in (restored.get("checkpoint_paths") or {}).items()
+                if imported_path_available(path)
+            }
             if restored.get("status") in {"queued", "running"}:
                 restored["status"] = "interrupted"
             fields = TrainingRun.__dataclass_fields__
@@ -995,7 +1024,7 @@ def import_project_package(
             "job_count": len(restored_jobs),
             "missing_models": missing_model_names,
             "missing_external_references": sorted(missing_external),
-            "missing_project_references": missing_project_references,
+            "missing_project_references": sorted(set(missing_project_references)),
             "checkpoint_validation_required": True,
         }
     except BaseException:

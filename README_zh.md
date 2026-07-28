@@ -57,6 +57,25 @@ python webui.py
 checkpoint、生成结果、字体和任务记录；共享模型库不会被删除。删除前需要明确确认，
 且必须先取消该项目仍在排队或运行中的任务。
 
+项目页也支持导出带版本的 `.zi2zi-project.zip` 项目包。轻量包包含项目配置、
+训练 run/任务记录、指标、审校元数据和报告；完整包还会包含项目素材、数据集、
+checkpoint、生成字形、字体和日志。共享基础模型默认只记录 SHA-256 引用，只有明确
+勾选后才会装入项目包。导入会先检查规范路径和包内每个文件的 SHA-256，然后创建新的
+项目 UUID，不覆盖或合并现有项目。PyTorch checkpoint 在导入阶段只会被复制而不会
+加载；导入的 checkpoint sidecar 不会直接获得信任，必须等待后台重新校验。导出前
+请确认拥有包内字体、模型和训练素材的再分发权限。
+
+同一流程也可以通过 CLI 使用：
+
+```bash
+python scripts/project_package.py export \
+  --data-dir webui_data --project-id <uuid> \
+  --output backup.zi2zi-project.zip --mode full
+python scripts/project_package.py inspect --package backup.zi2zi-project.zip
+python scripts/project_package.py import \
+  --data-dir webui_data --package backup.zi2zi-project.zip
+```
+
 也可以运行 `start_webui.bat`（Windows）、`./start_webui.sh`（Linux），或使用
 NVIDIA Docker：
 
