@@ -50,15 +50,11 @@ def parse_job_progress(
             epochs = max(_command_option(command, "--epochs", 1), 1)
             progress = (epoch + step / max(steps, 1)) / epochs
             return min(progress, 0.99), f"Epoch {epoch + 1}/{epochs} · step {step}/{steps}"
-    percentage = re.search(r"(?<!\d)(\d{1,3}(?:\.\d+)?)%", text)
-    if percentage:
-        value = min(float(percentage.group(1)) / 100, 0.99)
-        return value, text[:500]
-    ratio = re.search(r"[\[(]?\s*(\d+)\s*/\s*(\d+)\s*[\])]?", text)
-    if ratio:
-        current, total = (int(value) for value in ratio.groups())
-        if total > 0 and current <= total:
-            return min(current / total, 0.99), text[:500]
+    if job_type == "model_download":
+        percentage = re.search(r"(?<!\d)(\d{1,3}(?:\.\d+)?)%", text)
+        if percentage:
+            value = min(float(percentage.group(1)) / 100, 0.99)
+            return value, text[:500]
     return None, text[:500]
 
 

@@ -16,6 +16,11 @@ def main() -> None:
     parser.add_argument("--provenance-note", default="")
     args = parser.parse_args()
 
+    print(
+        'WEBUI_PROGRESS {"current": 0, "total": 1, '
+        '"message": "Validating checkpoint"}',
+        flush=True,
+    )
     metadata = validate_checkpoint(args.checkpoint)
     metadata["source"] = "trusted-shared-library"
     metadata["provenance_note"] = args.provenance_note
@@ -33,6 +38,11 @@ def main() -> None:
             ensure_ascii=False,
             indent=2,
         ),
+        flush=True,
+    )
+    print(
+        'WEBUI_PROGRESS {"current": 1, "total": 1, '
+        '"message": "Checkpoint validation complete"}',
         flush=True,
     )
 

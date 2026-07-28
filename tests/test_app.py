@@ -184,3 +184,27 @@ def test_training_page_defaults_horizontal_flip_off(tmp_path):
         assert slider.maximum == 0.5
     finally:
         jobs.stop()
+
+
+def test_live_monitors_use_stable_selection_and_paused_ten_second_charts(tmp_path):
+    storage = Storage(tmp_path / "state")
+    jobs = JobManager(storage)
+    try:
+        app = build_app(storage, jobs, language="en")
+        labelled = {
+            getattr(block, "label", ""): block
+            for block in app.blocks.values()
+            if getattr(block, "label", "")
+        }
+        assert labelled["Follow latest task"].value is False
+        assert labelled["Pause auto-refresh"].value is False
+        assert labelled["Current service language"].value == "English"
+        assert "Language / 语言" not in labelled
+        timer_values = [
+            block.value
+            for block in app.blocks.values()
+            if block.__class__.__name__ == "Timer"
+        ]
+        assert 10 in timer_values
+    finally:
+        jobs.stop()

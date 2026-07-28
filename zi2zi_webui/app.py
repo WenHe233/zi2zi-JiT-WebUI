@@ -8,7 +8,12 @@ from typing import Any
 from uuid import uuid4
 from urllib.parse import quote
 
-from .charts import latest_summary, run_parameter_rows, training_figures
+from .charts import (
+    latest_summary_from_records,
+    run_parameter_rows,
+    training_figures,
+    training_figures_from_records,
+)
 from .checkpoints import checkpoint_sidecar_path, read_checkpoint_sidecar
 from .devices import detect_devices, disk_free_gb
 from .font_builder import (
@@ -57,7 +62,11 @@ from .services import (
     training_command,
 )
 from .storage import Storage
-from .telemetry import export_metrics_csv, export_metrics_json, read_metrics
+from .telemetry import (
+    IncrementalMetricsCache,
+    export_metrics_csv,
+    export_metrics_json,
+)
 
 
 def training_snapshot_items(
@@ -109,6 +118,9 @@ def build_app(
 
     t = translator(language)
     b = lambda zh, en: en if language == "en" else zh
+    metrics_cache = IncrementalMetricsCache()
+    dashboard_status_cache: dict[str, str] = {}
+    job_log_cache: dict[str, Any] = {"job_id": None, "signature": None}
     catalog = preset_catalog("en" if language == "en" else "zh")
     preset_choices = [
         (
@@ -144,15 +156,21 @@ def build_app(
 
     def delete_project_action(project_id, confirmed):
         if not project_id:
-            raise gr.Error("Select a project first")
+            raise gr.Error(b("请先选择项目", "Select a project first"))
         if not confirmed:
-            raise gr.Error("Confirm permanent project deletion first")
+            raise gr.Error(
+                b("请先确认永久删除项目", "Confirm permanent project deletion first")
+            )
         try:
             deleted = storage.delete_project(project_id)
         except KeyError as exc:
-            raise gr.Error("The selected project no longer exists") from exc
+            raise gr.Error(
+                b("所选项目已不存在", "The selected project no longer exists")
+            ) from exc
         except (ValueError, OSError) as exc:
-            raise gr.Error(str(exc)) from exc
+            raise gr.Error(
+                f"{b('删除项目失败', 'Project deletion failed')}: {exc}"
+            ) from exc
         choices = project_choices()
         next_project_id = choices[0][1] if choices else None
         next_manifest = (
@@ -184,7 +202,7 @@ def build_app(
         kr_font,
     ):
         if not project_id:
-            raise gr.Error("Select a project first")
+            raise gr.Error(b("请先选择项目", "Select a project first"))
         project = storage.get_project(project_id)
         project.input_mode = input_mode
         if source_fonts:
@@ -232,22 +250,27 @@ def build_app(
                     try:
                         candidates.extend(scan_rendered_glyphs(path).values())
                     except ValueError as exc:
-                        raise gr.Error(str(exc)) from exc
+                        raise gr.Error(
+                            f"{b('字形图片校验失败', 'Glyph image validation failed')}: {exc}"
+                        ) from exc
                 elif path.suffix.lower() in {".png", ".jpg", ".jpeg"}:
                     candidates.append(path)
             project.style_reference_pool = choose_diverse_references(candidates, 8)
             if len(project.style_reference_pool) < 8:
                 raise gr.Error(
-                    "At least 8 valid target glyph images are required for style references"
+                    b(
+                        "风格参考至少需要 8 张有效目标字形图片",
+                        "At least 8 valid target glyph images are required for style references",
+                    )
                 )
         storage.save_project(project)
         return "Assets saved.\n" + project_summary(project_id)
 
     def attach_model(project_id, upload, trusted):
         if not project_id:
-            raise gr.Error("Select a project first")
+            raise gr.Error(b("请先选择项目", "Select a project first"))
         if not upload:
-            raise gr.Error("Choose a checkpoint")
+            raise gr.Error(b("请选择 checkpoint", "Choose a checkpoint"))
         metadata = import_model(storage, upload, trusted)
         project = storage.get_project(project_id)
         project.base_model = metadata["path"]
@@ -269,7 +292,9 @@ def build_app(
 
     def attach_shared_model(project_id, model_path):
         if not project_id or not model_path:
-            raise gr.Error("Select a project and shared model")
+            raise gr.Error(
+                b("请选择项目和共享模型", "Select a project and shared model")
+            )
         project = storage.get_project(project_id)
         project.base_model = model_path
         project.active_checkpoint = model_path
@@ -313,15 +338,24 @@ def build_app(
         train_count = int(train_count)
         test_count = int(test_count)
         if train_count < 9:
-            raise gr.Error("Training needs at least 9 distinct glyphs")
+            raise gr.Error(
+                b("训练至少需要 9 个不同字形", "Training needs at least 9 distinct glyphs")
+            )
         if test_count < 1:
-            raise gr.Error("Validation glyph count must be at least 1")
+            raise gr.Error(
+                b("验证字形数量至少为 1", "Validation glyph count must be at least 1")
+            )
         capacity = font_dataset_capacity(project, charset)
         if train_count + test_count > capacity:
             raise gr.Error(
-                f"The selected fonts and optional range filter have {capacity} usable common glyphs. "
-                f"Training + validation requested {train_count + test_count}; reduce training "
-                f"to at most {max(capacity - test_count, 0)}."
+                b(
+                    f"所选字体和范围筛选共有 {capacity} 个可用公共字形；训练与验证请求了 "
+                    f"{train_count + test_count} 个，请将训练数量降至 "
+                    f"{max(capacity - test_count, 0)} 或更少。",
+                    f"The selected fonts and optional range filter have {capacity} usable common glyphs. "
+                    f"Training + validation requested {train_count + test_count}; reduce training "
+                    f"to at most {max(capacity - test_count, 0)}.",
+                )
             )
         command, output = dataset_command(
             project,
@@ -342,7 +376,7 @@ def build_app(
 
     def analyze_dataset_capacity(project_id, charset, test_count):
         if not project_id:
-            raise gr.Error("Select a project")
+            raise gr.Error(b("请选择项目", "Select a project"))
         capacity = font_dataset_capacity(storage.get_project(project_id), charset)
         test_count = max(int(test_count), 1)
         return (
@@ -376,10 +410,20 @@ def build_app(
     ):
         project = storage.get_project(project_id)
         if not project.base_model:
-            raise gr.Error("Import or download and attach a base model first")
+            raise gr.Error(
+                b(
+                    "请先导入或下载并挂接基础模型",
+                    "Import or download and attach a base model first",
+                )
+            )
         flip_probability = float(horizontal_flip_prob)
         if not 0.0 <= flip_probability <= 0.5:
-            raise gr.Error("Horizontal flip probability must be between 0.0 and 0.5")
+            raise gr.Error(
+                b(
+                    "水平镜像概率必须在 0.0 到 0.5 之间",
+                    "Horizontal flip probability must be between 0.0 and 0.5",
+                )
+            )
         overrides: dict[str, Any] = {
             "epochs": int(epochs),
             "horizontal_flip_prob": flip_probability,
@@ -389,8 +433,12 @@ def build_app(
         except (FileNotFoundError, OSError, ValueError) as exc:
             job_id = ensure_checkpoint_validation(project.base_model, project_id)
             raise gr.Error(
-                f"Checkpoint metadata is missing or stale. Validation job {job_id} "
-                "is running; retry training after it succeeds."
+                b(
+                    f"Checkpoint 元数据缺失或已失效；校验任务 {job_id} 正在运行，"
+                    "成功后请重试训练。",
+                    f"Checkpoint metadata is missing or stale. Validation job {job_id} "
+                    "is running; retry training after it succeeds.",
+                )
             ) from exc
         for key in ("num_fonts", "num_chars"):
             if metadata.get(key):
@@ -398,8 +446,12 @@ def build_app(
         model_variant = infer_checkpoint_model(project.base_model, metadata)
         if not model_variant:
             raise gr.Error(
-                "Cannot determine whether the checkpoint is JiT-B/16 or JiT-L/16. "
-                "Re-import it to generate validated metadata."
+                b(
+                    "无法判断 checkpoint 是 JiT-B/16 还是 JiT-L/16；"
+                    "请重新导入以生成校验后的元数据。",
+                    "Cannot determine whether the checkpoint is JiT-B/16 or JiT-L/16. "
+                    "Re-import it to generate validated metadata.",
+                )
             )
         overrides["model"] = model_variant
         run, command = training_command(
@@ -434,7 +486,9 @@ def build_app(
             None,
         )
         if not parent:
-            raise gr.Error("Select a training run to resume")
+            raise gr.Error(
+                b("请选择要续训的训练 run", "Select a training run to resume")
+            )
         checkpoint = (
             storage.project_dir(project_id)
             / "training"
@@ -442,15 +496,27 @@ def build_app(
             / "checkpoint-last.pth"
         )
         if not checkpoint.is_file():
-            raise gr.Error("The selected run has no checkpoint-last.pth")
+            raise gr.Error(
+                b(
+                    "所选 run 没有 checkpoint-last.pth",
+                    "The selected run has no checkpoint-last.pth",
+                )
+            )
         source_dataset = parent.get("parameters", {}).get("dataset_path") or dataset_path
         if not source_dataset:
-            raise gr.Error("The original dataset path is unavailable")
+            raise gr.Error(
+                b("原始数据集路径不可用", "The original dataset path is unavailable")
+            )
         overrides = dict(parent.get("parameters", {}))
         overrides["epochs"] = int(epochs)
         flip_probability = float(horizontal_flip_prob)
         if not 0.0 <= flip_probability <= 0.5:
-            raise gr.Error("Horizontal flip probability must be between 0.0 and 0.5")
+            raise gr.Error(
+                b(
+                    "水平镜像概率必须在 0.0 到 0.5 之间",
+                    "Horizontal flip probability must be between 0.0 and 0.5",
+                )
+            )
         overrides["horizontal_flip_prob"] = flip_probability
         run, command = training_command(
             storage.get_project(project_id),
@@ -477,17 +543,22 @@ def build_app(
     def delete_training(project_id, run_ids, confirmed):
         selected_id = (run_ids or [None])[0]
         if not selected_id:
-            raise gr.Error("Select a training run")
+            raise gr.Error(b("请选择训练 run", "Select a training run"))
         if not confirmed:
-            raise gr.Error("Confirm permanent deletion first")
+            raise gr.Error(b("请先确认永久删除", "Confirm permanent deletion first"))
         selected = next(
             (item for item in project_runs(project_id) if item["id"] == selected_id),
             None,
         )
         if not selected:
-            raise gr.Error("Training run was not found")
+            raise gr.Error(b("找不到训练 run", "Training run was not found"))
         if selected.get("status") in {"queued", "running"}:
-            raise gr.Error("Cancel the active job before deleting its run")
+            raise gr.Error(
+                b(
+                    "删除 run 前请先取消活动任务",
+                    "Cancel the active job before deleting its run",
+                )
+            )
         storage.delete_training_run(project_id, selected_id)
         return run_choices(project_id), f"Deleted training run {selected_id}"
 
@@ -530,16 +601,16 @@ def build_app(
     def refresh_charts(project_id, run_ids):
         runs = project_runs(project_id)
         selected = [item for item in runs if item["id"] in (run_ids or [])][:5]
+        headers = ["parameter", *[item["id"][:8] for item in selected]]
+        records = [
+            (item["id"][:8], metrics_cache.read(item["metrics_path"]))
+            for item in selected
+        ]
         figures = (
-            training_figures([item["metrics_path"] for item in selected])
+            training_figures_from_records(records)
             if selected
             else (None, None, None, None)
         )
-        headers = ["parameter", *[item["id"][:8] for item in selected]]
-        records = [
-            (item["id"][:8], read_metrics(item["metrics_path"]))
-            for item in selected
-        ]
         checkpoints = [
             [
                 run_id,
@@ -569,11 +640,15 @@ def build_app(
                 f"**{b('训练失败原因', 'Training failure reason')}：** "
                 f"{selected[0]['error']}\n\n"
                 "```\n"
-                + latest_summary(selected[0]["metrics_path"])
+                + latest_summary_from_records(records[0][1])
                 + "\n```"
             )
         elif selected:
-            summary = "```\n" + latest_summary(selected[0]["metrics_path"]) + "\n```"
+            summary = (
+                "```\n"
+                + latest_summary_from_records(records[0][1])
+                + "\n```"
+            )
         else:
             summary = "No run selected."
         return (
@@ -585,11 +660,34 @@ def build_app(
             snapshots,
         )
 
+    def poll_charts(project_id, run_ids, paused):
+        selected = [
+            item
+            for item in project_runs(project_id)
+            if item["id"] in (run_ids or [])
+        ][:5]
+        if paused or not selected:
+            return (*[gr.skip() for _ in range(9)], gr.skip())
+        active = any(item["status"] in {"queued", "running"} for item in selected)
+        changed_to_terminal = any(
+            dashboard_status_cache.get(item["id"]) in {"queued", "running"}
+            and item["status"] not in {"queued", "running"}
+            for item in selected
+        )
+        for item in selected:
+            dashboard_status_cache[item["id"]] = item["status"]
+        if not active and not changed_to_terminal:
+            return (*[gr.skip() for _ in range(9)], gr.skip())
+        return (
+            *refresh_charts(project_id, run_ids),
+            generation_checkpoint_choices(project_id),
+        )
+
     def export_run_metrics(project_id, run_ids):
         runs = project_runs(project_id)
         selected = next((item for item in runs if item["id"] in (run_ids or [])), None)
         if not selected:
-            raise gr.Error("Select a run")
+            raise gr.Error(b("请选择 run", "Select a run"))
         destination = storage.project_dir(project_id) / "exports"
         csv_path = export_metrics_csv(
             selected["metrics_path"], destination / f"{selected['id']}-metrics.csv"
@@ -628,7 +726,9 @@ def build_app(
                 generation_checkpoint,
             )
         except ValueError as exc:
-            raise gr.Error(str(exc)) from exc
+            raise gr.Error(
+                f"{b('生成模型无效', 'Invalid generation model')}: {exc}"
+            ) from exc
         requested_codepoints, increments = resolve_selection(
             preset_ids or [],
             custom_text=text or "",
@@ -643,7 +743,12 @@ def build_app(
             requested_codepoints, target_font_path
         )
         if int(candidates) > 1 and len(codepoints) > 64 and not allow_large_candidates:
-            raise gr.Error("Candidate generation is limited to 64 glyphs unless explicitly unlocked")
+            raise gr.Error(
+                b(
+                    "候选生成默认最多 64 个字形，请显式解除限制后再继续",
+                    "Candidate generation is limited to 64 glyphs unless explicitly unlocked",
+                )
+            )
         request_id = uuid4().hex[:10]
         if split_regions:
             regional = resolve_selection_by_region(
@@ -678,7 +783,12 @@ def build_app(
                 ),
             )
         if len(project.style_reference_pool) < 8:
-            raise gr.Error("The project needs at least 8 style references")
+            raise gr.Error(
+                b(
+                    "项目至少需要 8 个风格参考",
+                    "The project needs at least 8 style references",
+                )
+            )
         request_dir = (
             storage.project_dir(project_id)
             / "generation"
@@ -707,7 +817,9 @@ def build_app(
                     candidates=int(candidates),
                 )
         except (OSError, ValueError) as exc:
-            raise gr.Error(str(exc)) from exc
+            raise gr.Error(
+                f"{b('生成请求校验失败', 'Generation request validation failed')}: {exc}"
+            ) from exc
 
         request_dir.mkdir(parents=True, exist_ok=False)
         write_selection_manifest(
@@ -860,14 +972,19 @@ def build_app(
 
     def save_candidate(project_id, batch_path, codepoint_label, image_path):
         if not codepoint_label or not image_path:
-            raise gr.Error("Choose a glyph and candidate")
+            raise gr.Error(b("请选择字形和候选", "Choose a glyph and candidate"))
         batch = validate_batch_path(
             storage.project_dir(project_id) / "generation",
             batch_path,
         )
         candidate = Path(image_path).resolve()
         if not candidate.is_file() or batch not in candidate.parents:
-            raise gr.Error("The selected candidate is not part of this batch")
+            raise gr.Error(
+                b(
+                    "所选候选不属于当前批次",
+                    "The selected candidate is not part of this batch",
+                )
+            )
         path = storage.project_dir(project_id) / "glyphs" / "selection.json"
         values = load_and_prune_selections(path)
         values[codepoint_label] = str(candidate)
@@ -876,7 +993,7 @@ def build_app(
 
     def clear_candidate(project_id, codepoint_label):
         if not project_id or not codepoint_label:
-            raise gr.Error("Choose a glyph")
+            raise gr.Error(b("请选择字形", "Choose a glyph"))
         path = storage.project_dir(project_id) / "glyphs" / "selection.json"
         values = load_and_prune_selections(path)
         removed = values.pop(codepoint_label, None)
@@ -913,10 +1030,12 @@ def build_app(
                 )
             )
         except ValueError as exc:
-            raise gr.Error(str(exc)) from exc
+            raise gr.Error(
+                f"{b('字体元数据无效', 'Invalid font metadata')}: {exc}"
+            ) from exc
         selection = project_dir / "glyphs" / "selection.json"
         if not str(generation_batch or "").strip():
-            raise gr.Error("Choose a generation batch")
+            raise gr.Error(b("请选择生成批次", "Choose a generation batch"))
         try:
             batch = validate_batch_path(
                 project_dir / "generation",
@@ -929,12 +1048,18 @@ def build_app(
                 selections=selected_values,
             )
         except (OSError, ValueError) as exc:
-            raise gr.Error(str(exc)) from exc
+            raise gr.Error(
+                f"{b('生成批次校验失败', 'Generation batch validation failed')}: {exc}"
+            ) from exc
         effective_glyph_count = len(discovered_glyphs)
         if not effective_glyph_count:
             raise gr.Error(
-                "No U+XXXX-named glyph images were found recursively. "
-                "Font export was stopped to avoid silently copying the target font unchanged."
+                b(
+                    "未递归找到以 U+XXXX 命名的字形图片。字体导出已停止，"
+                    "以避免静默复制未变化的目标字体。",
+                    "No U+XXXX-named glyph images were found recursively. "
+                    "Font export was stopped to avoid silently copying the target font unchanged.",
+                )
             )
         export_selection = project_dir / "glyphs" / f"export-{uuid4().hex}.json"
         export_selection.write_text(
@@ -951,7 +1076,9 @@ def build_app(
         base_font_path = ""
         if project.input_mode == "font":
             if not project.target_assets:
-                raise gr.Error("The project does not have a target font")
+                raise gr.Error(
+                    b("项目没有目标字体", "The project does not have a target font")
+                )
             base_font_path = project.target_assets[0]
             from fontTools.ttLib import TTFont
 
@@ -959,12 +1086,18 @@ def build_app(
             try:
                 if "glyf" not in base_font or "hmtx" not in base_font:
                     raise gr.Error(
-                        "Incremental packaging requires a TrueType-outline target; "
-                        "CFF-outline OTF fonts are not supported"
+                        b(
+                            "增量封装需要 TrueType 轮廓目标字体；不支持 CFF 轮廓 OTF",
+                            "Incremental packaging requires a TrueType-outline target; "
+                            "CFF-outline OTF fonts are not supported",
+                        )
                     )
                 if "fvar" in base_font or "gvar" in base_font:
                     raise gr.Error(
-                        "Incremental packaging does not support variable-font targets"
+                        b(
+                            "增量封装不支持可变字体目标",
+                            "Incremental packaging does not support variable-font targets",
+                        )
                     )
             finally:
                 base_font.close()
@@ -974,7 +1107,12 @@ def build_app(
             fonts_root = (project_dir / "fonts").resolve()
             output = (fonts_root / f"{family}-{suffix}-{version}.ttf").resolve()
             if output.parent != fonts_root:
-                raise gr.Error("Font output path escaped the project fonts directory")
+                raise gr.Error(
+                    b(
+                        "字体输出路径越出了项目 fonts 目录",
+                        "Font output path escaped the project fonts directory",
+                    )
+                )
             command = [
                 sys.executable,
                 str(ROOT / "scripts" / "build_font.py"),
@@ -1047,7 +1185,7 @@ def build_app(
             )
         return [str(item) for item in artifacts], [str(item) for item in svgs[-100:]], preview
 
-    def monitor_jobs(_project_id, selected_id=None, follow_latest=True):
+    def monitor_jobs(_project_id, selected_id=None, follow_latest=False):
         rows = jobs.list_jobs()
         table = [
             [
@@ -1092,18 +1230,36 @@ def build_app(
         )
         if reason:
             status += f"\n\n**{b('失败原因', 'Failure reason')}：** {reason}"
+        log_path = Path(job["log_path"])
+        signature = (
+            log_path.stat().st_mtime_ns,
+            log_path.stat().st_size,
+        ) if log_path.is_file() else None
+        if (
+            job_log_cache["job_id"] == selected
+            and job_log_cache["signature"] == signature
+        ):
+            log_value = gr.skip()
+        else:
+            job_log_cache.update(job_id=selected, signature=signature)
+            log_value = jobs.read_log(selected)
         return (
             table,
             gr.update(choices=choices, value=selected),
             round(float(job["progress"] or 0) * 100, 1),
             status,
-            jobs.read_log(selected),
+            log_value,
         )
 
     def retry_selected_job(job_id):
         job = jobs.get_job(job_id)
         if job["status"] not in {"failed", "cancelled", "interrupted"}:
-            raise gr.Error("Only failed, cancelled, or interrupted jobs can be retried")
+            raise gr.Error(
+                b(
+                    "只能重试失败、已取消或已中断的任务",
+                    "Only failed, cancelled, or interrupted jobs can be retried",
+                )
+            )
         if job["job_type"] != "training":
             return f"Retried as: {jobs.retry(job_id)}"
         command = json.loads(job["command_json"])
@@ -1113,10 +1269,20 @@ def build_app(
             data_index = command.index("--data_path") + 1
             test_index = command.index("--test_npz_path") + 1
         except (ValueError, IndexError) as exc:
-            raise gr.Error("Training command is missing checkpoint/model/dataset arguments") from exc
+            raise gr.Error(
+                b(
+                    "训练命令缺少 checkpoint、模型或数据集参数",
+                    "Training command is missing checkpoint/model/dataset arguments",
+                )
+            ) from exc
         variant = infer_checkpoint_model(checkpoint)
         if not variant:
-            raise gr.Error("Cannot infer checkpoint architecture for retry")
+            raise gr.Error(
+                b(
+                    "无法推断重试所需的 checkpoint 架构",
+                    "Cannot infer checkpoint architecture for retry",
+                )
+            )
         command[model_index] = variant
         command, safety_changes = clamp_training_retry_command(
             command,
@@ -1186,10 +1352,9 @@ def build_app(
                 scale=5,
             )
             refresh_projects_btn = gr.Button(t("refresh"), scale=1)
-            language_display = gr.Dropdown(
-                choices=[("简体中文", "zh"), ("English", "en")],
-                value=language,
-                label="Language / 语言",
+            language_display = gr.Textbox(
+                value="English" if language == "en" else "简体中文",
+                label=b("当前服务语言", "Current service language"),
                 interactive=False,
                 scale=1,
             )
@@ -1216,7 +1381,7 @@ def build_app(
                     scale=5,
                 )
                 follow_latest_job = gr.Checkbox(
-                    value=True,
+                    value=False,
                     label=b("自动跟随最新任务", "Follow latest task"),
                     scale=1,
                 )
@@ -1425,6 +1590,10 @@ def build_app(
                 refresh_runs_btn = gr.Button(b("刷新 run", "Refresh runs"))
                 refresh_charts_btn = gr.Button(b("刷新图表", "Refresh charts"))
                 export_metrics_btn = gr.Button(b("导出 CSV / JSON / 图表", "Export CSV / JSON / charts"))
+                pause_dashboard = gr.Checkbox(
+                    value=False,
+                    label=b("暂停自动刷新", "Pause auto-refresh"),
+                )
             with gr.Row():
                 confirm_delete_run = gr.Checkbox(
                     label=b("确认永久删除所选 run", "Confirm permanent deletion of selected run")
@@ -1755,10 +1924,10 @@ def build_app(
                 snapshot_gallery,
             ],
         )
-        dashboard_timer = gr.Timer(5)
+        dashboard_timer = gr.Timer(10)
         dashboard_timer.tick(
-            refresh_charts,
-            [project_selector, run_selector],
+            poll_charts,
+            [project_selector, run_selector, pause_dashboard],
             [
                 loss_plot,
                 lr_plot,
@@ -1769,6 +1938,7 @@ def build_app(
                 checkpoint_table,
                 alert_table,
                 snapshot_gallery,
+                generation_checkpoint,
             ],
         )
         export_metrics_btn.click(
@@ -1896,6 +2066,50 @@ def build_app(
             retry_selected_job,
             job_selector,
             job_action_status,
+        )
+
+        def initialize_app(project_id, selected_job_id):
+            if not project_id:
+                choices = project_choices()
+                project_id = choices[0][1] if choices else None
+            if project_id:
+                manifest = project_summary(project_id)
+                dataset = project_dataset_path(project_id)
+                runs = run_choices(project_id)
+                checkpoints = generation_checkpoint_choices(project_id)
+                batches = generation_batch_options(project_id)
+            else:
+                manifest = "{}"
+                dataset = ""
+                runs = gr.update(choices=[], value=[])
+                checkpoints = gr.update(choices=[], value=None)
+                batches = gr.update(choices=[], value=None)
+            return (
+                manifest,
+                dataset,
+                runs,
+                checkpoints,
+                batches,
+                batches,
+                *monitor_jobs(project_id, selected_job_id, False),
+            )
+
+        app.load(
+            initialize_app,
+            [project_selector, job_selector],
+            [
+                project_json,
+                dataset_path,
+                run_selector,
+                generation_checkpoint,
+                review_batch,
+                export_batch,
+                jobs_table,
+                job_selector,
+                job_progress,
+                job_monitor_status,
+                job_log,
+            ],
         )
 
     return app

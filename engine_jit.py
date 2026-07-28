@@ -318,6 +318,7 @@ def train_one_epoch_single_gpu(
                 'epoch': epoch,
                 'step': data_iter_step,
                 'global_step': completed_steps,
+                'total_steps': total_steps,
                 'steps_per_epoch': len(data_loader),
                 'loss': loss_value,
                 'lr': lr,

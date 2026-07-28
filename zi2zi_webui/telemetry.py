@@ -50,6 +50,24 @@ class MetricsWriter:
         with self._lock, self.path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(record, ensure_ascii=False) + "\n")
             handle.flush()
+        if record.get("phase") == "train":
+            current = record.get("global_step")
+            total = record.get("total_steps")
+            if isinstance(current, (int, float)) and isinstance(total, (int, float)):
+                progress = {
+                    "current": current,
+                    "total": total,
+                    "message": (
+                        f"Epoch {int(record.get('epoch', 0)) + 1} · "
+                        f"step {int(record.get('step', 0)) + 1}/"
+                        f"{int(record.get('steps_per_epoch', 0))}"
+                    ),
+                }
+                print(
+                    "WEBUI_PROGRESS "
+                    + json.dumps(progress, ensure_ascii=False),
+                    flush=True,
+                )
         return record
 
 
@@ -65,6 +83,44 @@ def read_metrics(path: str | Path) -> list[dict[str, Any]]:
             except json.JSONDecodeError:
                 continue
     return records
+
+
+class IncrementalMetricsCache:
+    """Incrementally parse append-only JSONL metrics while tolerating partial lines."""
+
+    def __init__(self):
+        self._entries: dict[Path, dict[str, Any]] = {}
+        self._lock = threading.Lock()
+
+    def read(self, path: str | Path) -> list[dict[str, Any]]:
+        source = Path(path).resolve()
+        if not source.exists():
+            return []
+        with self._lock:
+            entry = self._entries.setdefault(
+                source,
+                {"offset": 0, "partial": b"", "records": []},
+            )
+            size = source.stat().st_size
+            if size < entry["offset"]:
+                entry.update(offset=0, partial=b"", records=[])
+            with source.open("rb") as handle:
+                handle.seek(entry["offset"])
+                chunk = handle.read()
+                entry["offset"] = handle.tell()
+            payload = entry["partial"] + chunk
+            lines = payload.split(b"\n")
+            entry["partial"] = lines.pop() if lines else b""
+            for line in lines:
+                if not line.strip():
+                    continue
+                try:
+                    entry["records"].append(
+                        json.loads(line.decode("utf-8", errors="replace"))
+                    )
+                except json.JSONDecodeError:
+                    continue
+            return list(entry["records"])
 
 
 def export_metrics_csv(source: str | Path, destination: str | Path) -> Path:

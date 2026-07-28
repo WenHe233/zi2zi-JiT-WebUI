@@ -29,7 +29,7 @@ def test_single_worker_executes_job(tmp_path):
         manager.stop()
 
 
-def test_progress_parser_supports_training_and_generic_tasks():
+def test_progress_parser_supports_training_and_explicit_tasks():
     progress, text = parse_job_progress(
         "Epoch: [2]  [ 5/10] eta: 0:01:00",
         "training",
@@ -38,6 +38,14 @@ def test_progress_parser_supports_training_and_generic_tasks():
     assert progress == 0.25
     assert "Epoch 3/10" in text
     assert parse_job_progress("Downloading 40%", "model_download", [])[0] == 0.4
+    explicit, message = parse_job_progress(
+        'WEBUI_PROGRESS {"current": 3, "total": 10, "message": "Rendered 3"}',
+        "dataset",
+        [],
+    )
+    assert explicit == 0.3
+    assert message == "Rendered 3"
+    assert parse_job_progress("processing [3/10]", "dataset", [])[0] is None
 
 
 def test_failure_summary_explains_checkpoint_architecture_mismatch(tmp_path):
@@ -92,7 +100,9 @@ def test_live_job_progress_is_persisted(tmp_path):
                 sys.executable,
                 "-u",
                 "-c",
-                "import time; print('Downloading 25%', flush=True); time.sleep(1)",
+                "import time; print('WEBUI_PROGRESS "
+                '{\"current\": 1, \"total\": 4, \"message\": \"Rendered 25%\"}'
+                "', flush=True); time.sleep(1)",
             ],
             cwd=tmp_path,
         )
@@ -105,7 +115,7 @@ def test_live_job_progress_is_persisted(tmp_path):
                 break
             time.sleep(0.05)
         assert observed
-        assert "25%" in manager.get_job(job_id)["progress_text"]
+        assert "Rendered 25%" in manager.get_job(job_id)["progress_text"]
     finally:
         manager.stop()
 

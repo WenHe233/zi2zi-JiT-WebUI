@@ -7,6 +7,19 @@ import tempfile
 from pathlib import Path
 
 
+def emit_progress(current: int, total: int, message: str) -> None:
+    import json
+
+    print(
+        "WEBUI_PROGRESS "
+        + json.dumps(
+            {"current": current, "total": total, "message": message},
+            ensure_ascii=False,
+        ),
+        flush=True,
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Download a named model from the official zi2zi-JiT folder."
@@ -23,6 +36,7 @@ def main() -> None:
 
     output_dir = Path(args.output_dir).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
+    emit_progress(0, 2, "Downloading official model")
     with tempfile.TemporaryDirectory(prefix="zi2zi-model-") as temporary:
         downloaded = gdown.download_folder(
             url=args.folder_url,
@@ -36,6 +50,7 @@ def main() -> None:
             raise SystemExit(f"Expected model was not found in official folder: {args.expected}")
         destination = output_dir / args.expected
         shutil.copy2(matches[0], destination)
+        emit_progress(1, 2, "Download complete; validating checkpoint")
         from zi2zi_webui.checkpoints import write_checkpoint_sidecar
         from zi2zi_webui.services import validate_checkpoint
 
@@ -51,6 +66,7 @@ def main() -> None:
             f"SHA-256: {metadata['sha256']}",
             flush=True,
         )
+        emit_progress(2, 2, "Model download and validation complete")
 
 
 if __name__ == "__main__":

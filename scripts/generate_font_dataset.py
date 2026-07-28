@@ -123,6 +123,17 @@ def print_summary(label: str, summary: dict) -> None:
         print(f"  [{tag}] {font_file}: {info}")
 
 
+def emit_progress(current: int, total: int, message: str) -> None:
+    print(
+        "WEBUI_PROGRESS "
+        + json.dumps(
+            {"current": current, "total": total, "message": message},
+            ensure_ascii=False,
+        ),
+        flush=True,
+    )
+
+
 def main(args: argparse.Namespace) -> None:
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     output_dir = Path(args.output_dir)
@@ -137,6 +148,9 @@ def main(args: argparse.Namespace) -> None:
     font_dir = Path(args.font_dir).resolve() if args.font_dir else None
 
     train_dir = Path(args.train_dir) if args.train_dir else output_dir / "train"
+    total_stages = int(do_train) + int(do_test) * 2
+    completed_stages = 0
+    emit_progress(completed_stages, total_stages, "Preparing dataset build")
 
     if do_train:
         train_out = output_dir / "train"
@@ -165,6 +179,8 @@ def main(args: argparse.Namespace) -> None:
                 "Training dataset did not produce the requested number of glyphs"
             )
         train_dir = train_out
+        completed_stages += 1
+        emit_progress(completed_stages, total_stages, "Training split complete")
 
     if do_test:
         test_out = output_dir / "test"
@@ -191,6 +207,8 @@ def main(args: argparse.Namespace) -> None:
             raise RuntimeError(
                 "Validation dataset did not produce the requested number of glyphs"
             )
+        completed_stages += 1
+        emit_progress(completed_stages, total_stages, "Validation split complete")
 
         # Convert test set to NPZ
         npz_path = output_dir / "test.npz"
@@ -202,12 +220,15 @@ def main(args: argparse.Namespace) -> None:
             raise RuntimeError(
                 f"Validation NPZ contains {result['samples']} of {expected} expected samples"
             )
+        completed_stages += 1
+        emit_progress(completed_stages, total_stages, "Validation NPZ complete")
     write_build_marker(
         args.build_marker,
         "complete",
         train_count=args.train_chars_per_font if do_train else None,
         test_count=args.test_chars_per_font if do_test else None,
     )
+    emit_progress(total_stages, total_stages, "Dataset build complete")
 
 
 if __name__ == "__main__":

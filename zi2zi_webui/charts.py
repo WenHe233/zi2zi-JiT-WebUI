@@ -17,7 +17,10 @@ from .telemetry import read_metrics
 def training_figures(metric_paths: Iterable[str | Path]):
     paths = [Path(item) for item in metric_paths if item]
     records_by_run = [(path.parent.name[:8], read_metrics(path)) for path in paths]
+    return training_figures_from_records(records_by_run)
 
+
+def training_figures_from_records(records_by_run):
     figures = []
     specs = (
         ("Training loss", ("loss", "loss_ema"), "global_step"),
@@ -80,7 +83,10 @@ def run_parameter_rows(runs: list[dict]) -> list[list[str]]:
 
 
 def latest_summary(metric_path: str | Path) -> str:
-    records = read_metrics(metric_path)
+    return latest_summary_from_records(read_metrics(metric_path))
+
+
+def latest_summary_from_records(records) -> str:
     if not records:
         return "No metrics yet."
     last = next((item for item in reversed(records) if item.get("phase") == "train"), records[-1])
