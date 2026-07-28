@@ -25,6 +25,7 @@ Usage:
         --test-only --train-dir /path/to/existing_train
 """
 import argparse
+import json
 import logging
 from pathlib import Path
 
@@ -41,7 +42,16 @@ def get_args() -> argparse.Namespace:
         nargs="+",
         help="Ordered source/reference font paths; later fonts provide missing glyphs.",
     )
-    parser.add_argument("--font-dir", required=True, help="Directory containing target fonts.")
+    targets = parser.add_mutually_exclusive_group(required=True)
+    targets.add_argument(
+        "--font-dir",
+        help="Directory containing target fonts (legacy multi-font mode).",
+    )
+    targets.add_argument(
+        "--target-font",
+        action="append",
+        help="Exact target font to process. Repeat for multiple explicit fonts.",
+    )
     parser.add_argument("--output-dir", required=True,
                         help="Root output directory. Train goes to <output-dir>/train, test to <output-dir>/test.")
 
@@ -73,6 +83,11 @@ def get_args() -> argparse.Namespace:
                         ))
     parser.add_argument("--resolution", type=int, default=256, help="Glyph resolution (default: 256).")
     parser.add_argument("--num-workers", type=int, default=4, help="Parallel workers for font processing (default: 4).")
+    parser.add_argument(
+        "--build-marker",
+        default=None,
+        help="Optional WebUI dataset build-state marker.",
+    )
 
     args = parser.parse_args()
 
@@ -85,6 +100,19 @@ def get_args() -> argparse.Namespace:
     return args
 
 
+def write_build_marker(path: str | None, status: str, **details) -> None:
+    if not path:
+        return
+    marker = Path(path)
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    temporary = marker.with_suffix(marker.suffix + ".tmp")
+    temporary.write_text(
+        json.dumps({"schema_version": 1, "status": status, **details}, indent=2),
+        encoding="utf-8",
+    )
+    temporary.replace(marker)
+
+
 def print_summary(label: str, summary: dict) -> None:
     print(f"\n{label} generation completed: "
           f"total={summary['total']} success={summary['success']} failed={summary['failed']}")
@@ -95,12 +123,18 @@ def print_summary(label: str, summary: dict) -> None:
         print(f"  [{tag}] {font_file}: {info}")
 
 
-def main() -> None:
+def main(args: argparse.Namespace) -> None:
     logging.basicConfig(level=logging.INFO, format="%(message)s")
-    args = get_args()
     output_dir = Path(args.output_dir)
+    write_build_marker(args.build_marker, "building")
     do_train = not args.test_only
     do_test = not args.train_only
+    target_fonts = (
+        [Path(item).resolve() for item in args.target_font]
+        if args.target_font
+        else None
+    )
+    font_dir = Path(args.font_dir).resolve() if args.font_dir else None
 
     train_dir = Path(args.train_dir) if args.train_dir else output_dir / "train"
 
@@ -109,8 +143,9 @@ def main() -> None:
         print(f"=== Generating train dataset -> {train_out} ===")
         train_summary = generate_train_dataset(
             source_font=[Path(item) for item in args.source_font],
-            font_dir=Path(args.font_dir),
+            font_dir=font_dir,
             output_dir=train_out,
+            target_fonts=target_fonts,
             num_fonts=args.num_fonts,
             chars_per_font=args.train_chars_per_font,
             charset=args.charset,
@@ -120,6 +155,15 @@ def main() -> None:
             num_workers=args.num_workers,
         )
         print_summary("Train", train_summary)
+        if train_summary["failed"] or train_summary["success"] == 0:
+            raise RuntimeError("Training dataset generation failed")
+        if any(
+            result.get("extracted") != args.train_chars_per_font
+            for result in train_summary["results"]
+        ):
+            raise RuntimeError(
+                "Training dataset did not produce the requested number of glyphs"
+            )
         train_dir = train_out
 
     if do_test:
@@ -127,9 +171,10 @@ def main() -> None:
         print(f"\n=== Generating test dataset -> {test_out} ===")
         test_summary = generate_test_dataset(
             source_font=[Path(item) for item in args.source_font],
-            font_dir=Path(args.font_dir),
+            font_dir=font_dir,
             train_dir=train_dir,
             output_dir=test_out,
+            target_fonts=target_fonts,
             chars_per_font=args.test_chars_per_font,
             charset=args.charset,
             resolution=args.resolution,
@@ -137,13 +182,42 @@ def main() -> None:
             num_workers=args.num_workers,
         )
         print_summary("Test", test_summary)
+        if test_summary["failed"] or test_summary["success"] == 0:
+            raise RuntimeError("Validation dataset generation failed")
+        if any(
+            result.get("extracted") != args.test_chars_per_font
+            for result in test_summary["results"]
+        ):
+            raise RuntimeError(
+                "Validation dataset did not produce the requested number of glyphs"
+            )
 
         # Convert test set to NPZ
         npz_path = output_dir / "test.npz"
         print(f"\n=== Creating test NPZ -> {npz_path} ===")
         result = create_test_npz(test_out, npz_path)
         print(f"  {result['samples']} samples ({result['file_size_mb']:.1f} MB)")
+        expected = args.test_chars_per_font * test_summary["success"]
+        if result["samples"] != expected or not npz_path.is_file():
+            raise RuntimeError(
+                f"Validation NPZ contains {result['samples']} of {expected} expected samples"
+            )
+    write_build_marker(
+        args.build_marker,
+        "complete",
+        train_count=args.train_chars_per_font if do_train else None,
+        test_count=args.test_chars_per_font if do_test else None,
+    )
 
 
 if __name__ == "__main__":
-    main()
+    parsed_args = get_args()
+    try:
+        main(parsed_args)
+    except BaseException as exc:
+        write_build_marker(
+            parsed_args.build_marker,
+            "failed",
+            error=f"{type(exc).__name__}: {exc}",
+        )
+        raise

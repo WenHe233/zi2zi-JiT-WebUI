@@ -80,6 +80,11 @@ def get_args() -> argparse.Namespace:
     parser.add_argument("--resolution", type=int, default=256, help="Glyph resolution (default: 256).")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for train/test split (default: 42).")
     parser.add_argument("--train-only", action="store_true", help="Generate train dataset only, skip test.")
+    parser.add_argument(
+        "--build-marker",
+        default=None,
+        help="Optional WebUI dataset build-state marker.",
+    )
 
     args = parser.parse_args()
 
@@ -90,6 +95,19 @@ def get_args() -> argparse.Namespace:
             parser.error(f"--source-font does not exist: {source_font}")
 
     return args
+
+
+def write_build_marker(path: str | None, status: str, **details) -> None:
+    if not path:
+        return
+    marker = Path(path)
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    temporary = marker.with_suffix(marker.suffix + ".tmp")
+    temporary.write_text(
+        json.dumps({"schema_version": 1, "status": status, **details}, indent=2),
+        encoding="utf-8",
+    )
+    temporary.replace(marker)
 
 
 def load_glyphs(glyph_dir: Path) -> list:
@@ -202,9 +220,9 @@ def generate_split(
     return {"success": True, "extracted": successful, "failed": failed}
 
 
-def main() -> None:
+def main(args: argparse.Namespace) -> None:
     logging.basicConfig(level=logging.INFO, format="%(message)s")
-    args = get_args()
+    write_build_marker(args.build_marker, "building")
 
     glyph_dir = Path(args.glyph_dir)
     output_dir = Path(args.output_dir)
@@ -296,7 +314,22 @@ def main() -> None:
             )
 
     print("\nDone!")
+    write_build_marker(
+        args.build_marker,
+        "complete",
+        train_count=args.train_count,
+        test_count=0 if args.train_only else args.test_count,
+    )
 
 
 if __name__ == "__main__":
-    main()
+    parsed_args = get_args()
+    try:
+        main(parsed_args)
+    except BaseException as exc:
+        write_build_marker(
+            parsed_args.build_marker,
+            "failed",
+            error=f"{type(exc).__name__}: {exc}",
+        )
+        raise

@@ -41,6 +41,8 @@ def test_dataset_command_passes_ordered_regional_and_global_source_fonts(tmp_pat
         "global-1.ttf",
         "global-2.ttf",
     ]
+    assert command[command.index("--target-font") + 1] == "target.ttf"
+    assert "--font-dir" not in command
     assert "train100-test8" in str(output)
 
 
@@ -84,6 +86,39 @@ def test_rendered_glyph_dataset_passes_exact_validation_count(tmp_path):
 
     assert command[command.index("--train-count") + 1] == "9"
     assert command[command.index("--test-count") + 1] == "3"
+
+
+def test_repeated_dataset_commands_use_isolated_output_directories(tmp_path):
+    storage = Storage(tmp_path / "state")
+    project = storage.create_project("Isolated")
+    project.input_mode = "font"
+    project.global_source_fonts = ["source.ttf"]
+    project.target_assets = ["target.ttf"]
+
+    first_command, first_output = dataset_command(
+        project,
+        storage,
+        train_count=9,
+        test_count=1,
+        charset="auto",
+        workers=1,
+    )
+    second_command, second_output = dataset_command(
+        project,
+        storage,
+        train_count=9,
+        test_count=1,
+        charset="auto",
+        workers=1,
+    )
+
+    assert first_output != second_output
+    assert first_command[first_command.index("--build-marker") + 1] == str(
+        first_output / ".webui-dataset.json"
+    )
+    assert second_command[second_command.index("--build-marker") + 1] == str(
+        second_output / ".webui-dataset.json"
+    )
 
 
 def test_rendered_glyph_capacity_requires_valid_target_and_source_outlines(tmp_path):
@@ -139,6 +174,27 @@ def test_training_dataset_requires_train_directory_and_test_npz(tmp_path):
 
     with pytest.raises(ValueError, match="train/ and test.npz"):
         resolve_training_dataset(project, storage, dataset)
+
+
+def test_training_dataset_skips_new_build_without_complete_marker(tmp_path):
+    storage = Storage(tmp_path / "state")
+    project = storage.create_project("Build state")
+    datasets = storage.project_dir(project.id) / "datasets"
+    complete = datasets / "older"
+    failed = datasets / "newer"
+    for path in (complete, failed):
+        (path / "train").mkdir(parents=True)
+        (path / "test.npz").touch()
+    (complete / ".webui-dataset.json").write_text(
+        '{"schema_version": 1, "status": "complete"}',
+        encoding="utf-8",
+    )
+    (failed / ".webui-dataset.json").write_text(
+        '{"schema_version": 1, "status": "failed"}',
+        encoding="utf-8",
+    )
+
+    assert resolve_training_dataset(project, storage, failed) == complete.resolve()
 
 
 def test_single_epoch_training_always_saves_last_checkpoint():

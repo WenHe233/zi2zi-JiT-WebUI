@@ -405,7 +405,7 @@ def _train_one_font(args_tuple):
 
 def generate_train_dataset(
     source_font: SourceFonts,
-    font_dir: Path,
+    font_dir: Optional[Path],
     output_dir: Path,
     num_fonts: Optional[int] = None,
     chars_per_font: int = 500,
@@ -414,9 +414,15 @@ def generate_train_dataset(
     seed: int = 42,
     start_index: int = 1,
     num_workers: int = 1,
+    target_fonts: Optional[List[Path]] = None,
 ) -> dict:
     ensure_output_directory(str(output_dir))
-    font_files = _list_font_files(font_dir)
+    if target_fonts is not None:
+        font_files = [Path(path) for path in target_fonts]
+    elif font_dir is not None:
+        font_files = _list_font_files(font_dir)
+    else:
+        raise ValueError("font_dir or target_fonts is required")
     if num_fonts is not None:
         font_files = font_files[:num_fonts]
 
@@ -448,9 +454,25 @@ def generate_train_dataset(
     return {"total": len(results), "success": success, "failed": failed, "results": results}
 
 
-def _resolve_target_font(train_folder: Path, train_metadata: dict, font_dir: Path) -> Optional[Path]:
+def _resolve_target_font(
+    train_folder: Path,
+    train_metadata: dict,
+    font_dir: Optional[Path],
+    target_fonts: Optional[List[Path]] = None,
+) -> Optional[Path]:
     font_file = train_metadata.get("font_file")
+    if isinstance(font_file, str) and target_fonts is not None:
+        return next(
+            (
+                Path(path)
+                for path in target_fonts
+                if Path(path).name == font_file and Path(path).is_file()
+            ),
+            None,
+        )
     if isinstance(font_file, str):
+        if font_dir is None:
+            return None
         candidate = font_dir / font_file
         if candidate.exists():
             return candidate
@@ -461,6 +483,8 @@ def _resolve_target_font(train_folder: Path, train_metadata: dict, font_dir: Pat
     else:
         stem = train_folder.name
 
+    if font_dir is None:
+        return None
     for ext in (".TTF", ".ttf", ".OTF", ".otf"):
         candidate = font_dir / f"{stem}{ext}"
         if candidate.exists():
@@ -489,7 +513,7 @@ def _test_one_font(args_tuple):
 
 def generate_test_dataset(
     source_font: SourceFonts,
-    font_dir: Path,
+    font_dir: Optional[Path],
     train_dir: Path,
     output_dir: Path,
     chars_per_font: int = 8,
@@ -497,6 +521,7 @@ def generate_test_dataset(
     resolution: int = DEFAULT_IMAGE_RESOLUTION,
     seed: int = 99999,
     num_workers: int = 1,
+    target_fonts: Optional[List[Path]] = None,
 ) -> dict:
     ensure_output_directory(str(output_dir))
     train_folders = sorted([p for p in train_dir.iterdir() if p.is_dir()], key=lambda p: p.name.lower())
@@ -518,7 +543,12 @@ def generate_test_dataset(
         with open(metadata_path, "r", encoding="utf-8") as f:
             train_metadata = json.load(f)
 
-        target_font = _resolve_target_font(train_folder, train_metadata, font_dir)
+        target_font = _resolve_target_font(
+            train_folder,
+            train_metadata,
+            font_dir,
+            target_fonts,
+        )
         if target_font is None:
             result_map[offset] = {
                 "success": False,

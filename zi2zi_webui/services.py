@@ -7,6 +7,7 @@ import shutil
 import sys
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 from .devices import detect_devices, training_preset
 from .jobs import JobManager
@@ -272,8 +273,12 @@ def dataset_command(
     output = (
         project_dir
         / "datasets"
-        / f"dataset-{charset}-train{train_count}-test{test_count}"
+        / (
+            f"dataset-{charset}-train{train_count}-test{test_count}"
+            f"-{uuid4().hex}"
+        )
     )
+    build_marker = output / ".webui-dataset.json"
     charset_region = {
         "gb2312": "SC",
         "gbk": "SC",
@@ -286,14 +291,13 @@ def dataset_command(
         if not source_fonts or not manifest.target_assets:
             raise ValueError("At least one source font and one target font are required")
         target = Path(manifest.target_assets[0])
-        target_dir = target.parent
         command = [
             sys.executable,
             str(ROOT / "scripts" / "generate_font_dataset.py"),
             "--source-font",
             *source_fonts,
-            "--font-dir",
-            str(target_dir),
+            "--target-font",
+            str(target),
             "--output-dir",
             str(output),
             "--num-fonts",
@@ -306,6 +310,8 @@ def dataset_command(
             charset,
             "--num-workers",
             str(workers),
+            "--build-marker",
+            str(build_marker),
         ]
     else:
         if not source_fonts or not manifest.target_assets:
@@ -323,6 +329,8 @@ def dataset_command(
             str(train_count),
             "--test-count",
             str(test_count),
+            "--build-marker",
+            str(build_marker),
         ]
     return command, output
 
@@ -352,7 +360,21 @@ def resolve_training_dataset(
         candidates.extend(path.resolve() for path in discovered if path.resolve() not in candidates)
 
     for candidate in candidates:
-        if (candidate / "train").is_dir() and (candidate / "test.npz").is_file():
+        marker = candidate / ".webui-dataset.json"
+        marker_complete = True
+        if marker.exists():
+            try:
+                marker_complete = (
+                    json.loads(marker.read_text(encoding="utf-8")).get("status")
+                    == "complete"
+                )
+            except (OSError, ValueError, json.JSONDecodeError):
+                marker_complete = False
+        if (
+            marker_complete
+            and (candidate / "train").is_dir()
+            and (candidate / "test.npz").is_file()
+        ):
             return candidate
 
     checked = ", ".join(str(path) for path in candidates) or str(datasets_root)
