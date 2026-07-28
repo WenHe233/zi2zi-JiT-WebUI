@@ -10,7 +10,7 @@ from urllib.parse import quote
 
 from .charts import latest_summary, run_parameter_rows, training_figures
 from .devices import detect_devices, disk_free_gb
-from .font_builder import codepoint_from_filename
+from .font_builder import codepoint_from_filename, scan_glyph_directory
 from .i18n import translator
 from .inference import (
     build_inference_npz,
@@ -743,6 +743,29 @@ def build_app(
         project = storage.get_project(project_id)
         project_dir = storage.project_dir(project_id)
         selection = project_dir / "glyphs" / "selection.json"
+        if not str(glyph_dir or "").strip():
+            raise gr.Error("Choose a generated glyph directory")
+        try:
+            discovered_glyphs = scan_glyph_directory(glyph_dir)
+        except (OSError, ValueError) as exc:
+            raise gr.Error(str(exc)) from exc
+        selected_codepoints: set[int] = set()
+        if selection.is_file():
+            try:
+                selected_values = json.loads(selection.read_text(encoding="utf-8"))
+                selected_codepoints = {
+                    int(label.removeprefix("U+"), 16)
+                    for label, image_path in selected_values.items()
+                    if Path(image_path).is_file()
+                }
+            except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+                raise gr.Error(f"Invalid glyph selection manifest: {exc}") from exc
+        effective_glyph_count = len(set(discovered_glyphs) | selected_codepoints)
+        if not effective_glyph_count:
+            raise gr.Error(
+                "No U+XXXX-named glyph images were found recursively. "
+                "Font export was stopped to avoid silently copying the target font unchanged."
+            )
         base_font_path = ""
         if project.input_mode == "font":
             if not project.target_assets:
@@ -800,7 +823,10 @@ def build_app(
             job_ids.append(
                 jobs.submit("font_build", command, project_id=project_id, cwd=ROOT)
             )
-        return f"Queued font build jobs: {', '.join(job_ids)}"
+        return (
+            f"Queued font build jobs: {', '.join(job_ids)}. "
+            f"Discovered {effective_glyph_count} generated glyphs recursively."
+        )
 
     def refresh_font_artifacts(project_id, sample_text):
         project_dir = storage.project_dir(project_id)

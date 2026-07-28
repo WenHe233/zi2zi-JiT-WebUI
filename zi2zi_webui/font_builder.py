@@ -4,6 +4,8 @@ import html
 import hashlib
 import json
 import re
+import shutil
+import tempfile
 import xml.etree.ElementTree as ET
 import zipfile
 from dataclasses import asdict, dataclass
@@ -21,7 +23,7 @@ from fontTools.svgLib.path import parse_path
 from fontTools.ttLib import TTFont
 from fontTools.ttLib.tables._c_m_a_p import CmapSubtable
 
-from data_processing.font_utils import get_outline_codepoints
+from data_processing.font_utils import get_preserved_codepoints
 
 
 ATTRIBUTION = "Created using zi2zi-JiT artifacts"
@@ -56,9 +58,11 @@ def preprocess_glyph(
     options: VectorizeOptions | None = None,
 ) -> dict:
     options = options or VectorizeOptions()
-    gray = cv2.imread(str(source), cv2.IMREAD_GRAYSCALE)
-    if gray is None:
-        raise ValueError(f"Cannot read image: {source}")
+    try:
+        with Image.open(source) as image:
+            gray = np.asarray(image.convert("L"))
+    except (OSError, ValueError) as exc:
+        raise ValueError(f"Cannot read image: {source}") from exc
     if gray.mean() < 127:
         gray = 255 - gray
     _, bitmap = cv2.threshold(gray, options.threshold, 255, cv2.THRESH_BINARY_INV)
@@ -71,7 +75,7 @@ def preprocess_glyph(
         bitmap = cleaned
     destination = Path(destination)
     destination.parent.mkdir(parents=True, exist_ok=True)
-    cv2.imwrite(str(destination), 255 - bitmap)
+    Image.fromarray(255 - bitmap).save(destination, format="PNG")
     contours, hierarchy = cv2.findContours(bitmap, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
     ink = np.where(bitmap > 0)
     bbox = None
@@ -99,21 +103,37 @@ def vectorize_png(
     try:
         import vtracer
 
-        vtracer.convert_image_to_svg_py(
-            str(processed),
-            str(svg_path),
-            colormode="binary",
-            mode="spline",
-        )
+        # The Rust vtracer binding cannot reliably open Unicode paths on
+        # Windows. Bridge through a short ASCII-only temporary directory and
+        # copy the result back with Python's Unicode-safe filesystem APIs.
+        with tempfile.TemporaryDirectory(prefix="zi2zi-vtracer-") as temporary:
+            temporary_root = Path(temporary)
+            temporary_input = temporary_root / "glyph.png"
+            temporary_output = temporary_root / "glyph.svg"
+            shutil.copyfile(processed, temporary_input)
+            vtracer.convert_image_to_svg_py(
+                str(temporary_input),
+                str(temporary_output),
+                colormode="binary",
+                mode="spline",
+            )
+            shutil.copyfile(temporary_output, svg_path)
         qa["vectorizer"] = "vtracer"
     except ImportError:
         _opencv_svg(processed, svg_path)
         qa["vectorizer"] = "opencv-fallback"
+    except (KeyboardInterrupt, SystemExit):
+        raise
+    except BaseException as exc:
+        _opencv_svg(processed, svg_path)
+        qa["vectorizer"] = "opencv-fallback"
+        qa["vectorizer_warning"] = f"{type(exc).__name__}: {exc}"
     return qa
 
 
 def _opencv_svg(source: str | Path, destination: str | Path) -> None:
-    gray = cv2.imread(str(source), cv2.IMREAD_GRAYSCALE)
+    with Image.open(source) as image:
+        gray = np.asarray(image.convert("L"))
     bitmap = cv2.threshold(gray, 128, 255, cv2.THRESH_BINARY_INV)[1]
     contours, hierarchy = cv2.findContours(bitmap, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
     parts = []
@@ -272,7 +292,7 @@ def build_ttf(
                 raise ValueError(
                     "Incremental packaging does not support variable-font targets"
                 )
-            existing_outlines = get_outline_codepoints(candidate_font)
+            existing_outlines = get_preserved_codepoints(candidate_font)
             glyphs = candidate_font["glyf"].glyphs
             metrics = candidate_font["hmtx"].metrics
             character_map = dict(candidate_font.getBestCmap() or {})
@@ -494,13 +514,23 @@ def _write_html_report(report: dict, output: Path) -> None:
 
 
 def scan_glyph_directory(path: str | Path) -> dict[int, Path]:
-    result = {}
-    for item in Path(path).iterdir():
+    root = Path(path)
+    if not root.is_dir():
+        raise ValueError(f"Generated glyph directory does not exist: {root}")
+    candidates: list[tuple[int, str, int, Path]] = []
+    for item in root.rglob("*"):
         if item.suffix.lower() not in {".png", ".jpg", ".jpeg"}:
             continue
         codepoint = codepoint_from_filename(item)
         if codepoint is not None:
-            result[codepoint] = item
+            # Prefer the generator's canonical `generated` directory over
+            # pairwise previews, then use a stable path order. User-reviewed
+            # selections are applied separately and override this default.
+            priority = 0 if item.parent.name.lower() == "generated" else 1
+            candidates.append((priority, item.as_posix(), codepoint, item))
+    result: dict[int, Path] = {}
+    for _priority, _path_key, codepoint, item in sorted(candidates):
+        result.setdefault(codepoint, item)
     return result
 
 
@@ -565,7 +595,12 @@ def build_export_package(
                 archive.write(Path(source), f"png/U+{codepoint:04X}{Path(source).suffix.lower()}")
         if svg_dir.is_dir():
             for svg in sorted(svg_dir.glob("*.svg")):
-                archive.write(svg, f"svg/{svg.name}")
+                codepoint = codepoint_from_filename(svg)
+                if (
+                    codepoint is not None
+                    and f"U+{codepoint:04X}" in included
+                ):
+                    archive.write(svg, f"svg/{svg.name}")
         if project_dir:
             project_root = Path(project_dir).resolve()
             artifacts = [

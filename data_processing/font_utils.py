@@ -99,6 +99,19 @@ def get_outline_codepoints(font: TTFont) -> Set[int]:
     return {codepoint for codepoint in cmap if has_valid_outline(font, codepoint)}
 
 
+def get_preserved_codepoints(font: TTFont) -> Set[int]:
+    """Return target codepoints that must not be replaced during generation.
+
+    Whitespace glyphs are intentionally outline-free in normal fonts, so a
+    cmap-backed space must be retained even though ``has_valid_outline`` is
+    false.
+    """
+    cmap = font.getBestCmap() or {}
+    return get_outline_codepoints(font) | {
+        codepoint for codepoint in cmap if chr(codepoint).isspace()
+    }
+
+
 def extract_font_name(font: TTFont, fallback_path: Path) -> str:
     name_table = font.get("name")
     if not name_table:

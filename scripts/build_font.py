@@ -41,8 +41,11 @@ def main() -> None:
         selections = json.loads(Path(args.selection_manifest).read_text(encoding="utf-8"))
         for label, path in selections.items():
             glyphs[int(label.removeprefix("U+"), 16)] = Path(path)
-    if not glyphs and not args.base_font:
-        raise SystemExit("No U+XXXX-named glyph images were found.")
+    if not glyphs:
+        raise SystemExit(
+            "No U+XXXX-named glyph images were found recursively under "
+            f"{Path(args.glyph_dir).resolve()}. Refusing to export an unchanged base font."
+        )
     report = build_ttf(
         glyphs,
         args.output,

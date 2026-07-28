@@ -13,6 +13,7 @@ from data_processing.font_utils import (
     GlyphRendererPool,
     get_cjk_codepoints,
     get_outline_codepoints,
+    get_preserved_codepoints,
     load_font,
 )
 
@@ -43,7 +44,7 @@ def exclude_existing_target_glyphs(
         return requested, []
     target_font, _ = load_font(str(target_font_path))
     try:
-        existing = get_outline_codepoints(target_font)
+        existing = get_preserved_codepoints(target_font)
     finally:
         target_font.close()
     skipped = [codepoint for codepoint in requested if codepoint in existing]

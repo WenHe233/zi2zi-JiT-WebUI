@@ -1,15 +1,18 @@
 from pathlib import Path
 
 from PIL import Image, ImageDraw
+from fontTools.pens.ttGlyphPen import TTGlyphPen
 from fontTools.ttLib import TTFont
 
-from data_processing.font_utils import GlyphRendererPool
+from data_processing.font_utils import GlyphRendererPool, get_preserved_codepoints
 from zi2zi_webui.font_builder import (
     ATTRIBUTION,
     FontMetadata,
     build_export_package,
     build_ttf,
     codepoint_from_filename,
+    scan_glyph_directory,
+    vectorize_png,
 )
 from zi2zi_webui.inference import (
     exclude_existing_target_glyphs,
@@ -31,6 +34,97 @@ def test_filename_codepoint_parser():
     assert codepoint_from_filename("not-a-glyph.png") is None
 
 
+def test_scan_glyph_directory_finds_nested_generator_outputs(tmp_path):
+    generated = tmp_path / "ab2-steps20" / "generated"
+    generated.mkdir(parents=True)
+    first = generated / "0000_U+3400.png"
+    second = generated / "0001_U+3401.png"
+    _glyph(first)
+    _glyph(second)
+
+    assert scan_glyph_directory(tmp_path) == {
+        0x3400: first,
+        0x3401: second,
+    }
+
+
+def test_scan_prefers_generated_glyph_over_pairwise_preview(tmp_path):
+    generated = tmp_path / "run" / "generated"
+    pairs = tmp_path / "run" / "pairs"
+    generated.mkdir(parents=True)
+    pairs.mkdir(parents=True)
+    canonical = generated / "0000_U+3400.png"
+    preview = pairs / "0000_U+3400.png"
+    _glyph(canonical)
+    _glyph(preview)
+
+    assert scan_glyph_directory(tmp_path)[0x3400] == canonical
+
+
+def test_vectorization_supports_unicode_output_paths(tmp_path):
+    source = tmp_path / "glyph.png"
+    _glyph(source)
+    svg = tmp_path / "中文字体" / "U+3400.svg"
+
+    report = vectorize_png(source, svg)
+
+    assert svg.is_file()
+    assert report["contours"] > 0
+
+
+def test_vectorization_falls_back_when_vtracer_panics(tmp_path, monkeypatch):
+    import vtracer
+
+    class SimulatedPanic(BaseException):
+        pass
+
+    def panic(*_args, **_kwargs):
+        raise SimulatedPanic("simulated Rust panic")
+
+    monkeypatch.setattr(vtracer, "convert_image_to_svg_py", panic)
+    source = tmp_path / "glyph.png"
+    _glyph(source)
+    svg = tmp_path / "fallback.svg"
+
+    report = vectorize_png(source, svg)
+
+    assert svg.is_file()
+    assert report["vectorizer"] == "opencv-fallback"
+    assert "SimulatedPanic" in report["vectorizer_warning"]
+
+
+def test_mapped_whitespace_is_preserved_without_an_outline(tmp_path):
+    source = tmp_path / "shape.png"
+    _glyph(source)
+    base_path = tmp_path / "Base.ttf"
+    build_ttf(
+        {0x4E00: source},
+        base_path,
+        FontMetadata(family_name="Base"),
+    )
+    font = TTFont(base_path)
+    empty_name = "space"
+    empty_pen = TTGlyphPen(None)
+    font["glyf"].glyphs[empty_name] = empty_pen.glyph()
+    font["hmtx"].metrics[empty_name] = (500, 0)
+    font.setGlyphOrder([*font.getGlyphOrder(), empty_name])
+    for table in font["cmap"].tables:
+        if table.isUnicode() and hasattr(table, "cmap") and table.format != 14:
+            table.cmap[0x20] = empty_name
+    font.save(base_path)
+    font.close()
+
+    reopened = TTFont(base_path)
+    try:
+        assert 0x20 in get_preserved_codepoints(reopened)
+    finally:
+        reopened.close()
+
+    generated, skipped = exclude_existing_target_glyphs([0x20, 0x4E01], base_path)
+    assert generated == [0x4E01]
+    assert skipped == [0x20]
+
+
 def test_build_ttf_with_hole(tmp_path):
     source = tmp_path / "U+4E00.png"
     _glyph(source)
@@ -46,6 +140,8 @@ def test_build_ttf_with_hole(tmp_path):
     font = TTFont(output)
     assert font.getBestCmap()[0x4E00] == "uni4E00"
     assert font["head"].unitsPerEm == 1000
+    stale_svg = output.with_suffix("") / "svg" / "U+4E01.svg"
+    stale_svg.write_text("<svg/>", encoding="utf-8")
     package = build_export_package(output, {0x4E00: source})
     assert package.is_file()
     import zipfile
@@ -54,6 +150,8 @@ def test_build_ttf_with_hole(tmp_path):
         assert {"font/Demo.ttf", "README.txt", "glyph-manifest.json"}.issubset(
             archive.namelist()
         )
+        assert "svg/U+4E00.svg" in archive.namelist()
+        assert "svg/U+4E01.svg" not in archive.namelist()
 
 
 def test_target_font_existing_glyphs_are_skipped_and_missing_glyphs_are_merged(tmp_path):

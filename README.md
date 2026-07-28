@@ -159,6 +159,8 @@ proportional Latin metrics or a 2:1 CJK/Latin profile for added glyphs and
 creates a ZIP containing the merged TTF, selected PNGs, SVGs, manifests,
 training and font-quality reports, and a README. Confirm that the target
 font's license permits modification and redistribution before publishing.
+The exporter searches generator output directories recursively and refuses an
+empty build instead of silently repackaging the unchanged target font.
 
 See [character preset design](docs/charset-presets.md) for preset provenance
 and regional-font behavior.
