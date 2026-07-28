@@ -194,16 +194,17 @@ class JobManager:
                     utc_now(),
                 )
             )
-        with self.storage._connect() as db:
-            db.executemany(
-                """
-                INSERT INTO jobs(
-                    id, project_id, job_type, status, command_json, cwd, gpu,
-                    env_json, log_path, resume_point, created_at
-                ) VALUES (?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?)
-                """,
-                records,
-            )
+        with self._lock:
+            with self.storage._connect() as db:
+                db.executemany(
+                    """
+                    INSERT INTO jobs(
+                        id, project_id, job_type, status, command_json, cwd, gpu,
+                        env_json, log_path, resume_point, created_at
+                    ) VALUES (?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    records,
+                )
         job_ids = [record[0] for record in records]
         for job_id in job_ids:
             self._queue.put(job_id)
@@ -247,17 +248,25 @@ class JobManager:
     def cancel(self, job_id: str) -> bool:
         job = self.get_job(job_id)
         if job["status"] == "queued":
-            self._update(
+            return self._transition(
                 job_id,
+                {"queued"},
                 status="cancelled",
                 progress_text="Cancelled before start",
                 finished_at=utc_now(),
             )
-            return True
         with self._lock:
             process = self._processes.get(job_id)
-        if not process:
-            return False
+            if not process or process.poll() is not None:
+                return False
+            if not self._transition(
+                job_id,
+                {"running"},
+                status="cancelled",
+                progress_text="Cancelled by user",
+                finished_at=utc_now(),
+            ):
+                return False
         self._terminate_tree(process)
         return True
 
@@ -286,9 +295,29 @@ class JobManager:
         self._stopping.set()
         self._queue.put(None)
         with self._lock:
-            processes = list(self._processes.values())
-        for process in processes:
-            self._terminate_tree(process, final_status="interrupted")
+            with self.storage._connect() as db:
+                db.execute(
+                    """
+                    UPDATE jobs
+                    SET status='interrupted',
+                        progress_text='Interrupted during application shutdown',
+                        finished_at=?
+                    WHERE status='queued'
+                    """,
+                    (utc_now(),),
+                )
+        with self._lock:
+            processes = list(self._processes.items())
+            for job_id, _process in processes:
+                self._transition(
+                    job_id,
+                    {"running"},
+                    status="interrupted",
+                    progress_text="Interrupted during application shutdown",
+                    finished_at=utc_now(),
+                )
+        for _job_id, process in processes:
+            self._terminate_tree(process)
 
     def _run(self) -> None:
         while not self._stopping.is_set():
@@ -301,13 +330,18 @@ class JobManager:
                     continue
                 self._execute(job)
             except Exception as exc:
-                self._update(
-                    job_id,
-                    status="failed",
-                    error=f"{type(exc).__name__}: {exc}",
-                    progress_text=f"Failed: {type(exc).__name__}: {exc}"[:2000],
-                    finished_at=utc_now(),
-                )
+                try:
+                    status = self.get_job(job_id)["status"]
+                except KeyError:
+                    status = ""
+                if status not in {"cancelled", "interrupted"}:
+                    self._update(
+                        job_id,
+                        status="failed",
+                        error=f"{type(exc).__name__}: {exc}",
+                        progress_text=f"Failed: {type(exc).__name__}: {exc}"[:2000],
+                        finished_at=utc_now(),
+                    )
 
     def _execute(self, job: dict[str, Any]) -> None:
         job_id = job["id"]
@@ -345,13 +379,19 @@ class JobManager:
             )
             with self._lock:
                 self._processes[job_id] = process
-            self._update(
+            started = self._transition(
                 job_id,
+                {"queued"},
                 status="running",
                 pid=process.pid,
                 progress_text="Process started",
                 started_at=utc_now(),
             )
+            if not started:
+                self._terminate_tree(process)
+                with self._lock:
+                    self._processes.pop(job_id, None)
+                return
             assert process.stdout is not None
             command = json.loads(job["command_json"])
             last_progress = float(job.get("progress") or 0)
@@ -383,8 +423,9 @@ class JobManager:
         if current["status"] in {"cancelled", "interrupted"}:
             self._update(job_id, return_code=return_code, finished_at=utc_now())
         elif return_code == 0:
-            self._update(
+            self._transition(
                 job_id,
+                {"running"},
                 status="succeeded",
                 progress=1.0,
                 progress_text="Completed",
@@ -393,8 +434,9 @@ class JobManager:
             )
         else:
             reason = summarize_failure(log_path, return_code)
-            self._update(
+            self._transition(
                 job_id,
+                {"running"},
                 status="failed",
                 return_code=return_code,
                 error=reason,
@@ -405,8 +447,6 @@ class JobManager:
     def _terminate_tree(
         self,
         process: subprocess.Popen[str],
-        *,
-        final_status: str = "cancelled",
     ) -> None:
         try:
             import psutil
@@ -419,28 +459,42 @@ class JobManager:
             _, alive = psutil.wait_procs([root, *children], timeout=5)
             for item in alive:
                 item.kill()
-        except (ImportError, OSError):
-            if os.name == "nt":
-                process.send_signal(signal.CTRL_BREAK_EVENT)
-            else:
-                os.killpg(os.getpgid(process.pid), signal.SIGTERM)
-        self._update(
-            next((key for key, value in self._processes.items() if value is process), ""),
-            status=final_status,
-            progress_text=(
-                "Interrupted during application shutdown"
-                if final_status == "interrupted"
-                else "Cancelled by user"
-            ),
-            finished_at=utc_now(),
-        )
-
+        except Exception:
+            if process.poll() is not None:
+                return
+            try:
+                if os.name == "nt":
+                    process.send_signal(signal.CTRL_BREAK_EVENT)
+                else:
+                    os.killpg(os.getpgid(process.pid), signal.SIGTERM)
+            except (OSError, ProcessLookupError):
+                pass
     def _update(self, job_id: str, **values: Any) -> None:
         if not job_id or not values:
             return
         columns = ", ".join(f"{key}=?" for key in values)
-        with self.storage._connect() as db:
-            db.execute(
-                f"UPDATE jobs SET {columns} WHERE id=?",
-                [*values.values(), job_id],
-            )
+        with self._lock:
+            with self.storage._connect() as db:
+                db.execute(
+                    f"UPDATE jobs SET {columns} WHERE id=?",
+                    [*values.values(), job_id],
+                )
+
+    def _transition(
+        self,
+        job_id: str,
+        expected: set[str],
+        **values: Any,
+    ) -> bool:
+        if not job_id or not values or not expected:
+            return False
+        columns = ", ".join(f"{key}=?" for key in values)
+        placeholders = ", ".join("?" for _ in expected)
+        with self._lock:
+            with self.storage._connect() as db:
+                cursor = db.execute(
+                    f"UPDATE jobs SET {columns} "
+                    f"WHERE id=? AND status IN ({placeholders})",
+                    [*values.values(), job_id, *sorted(expected)],
+                )
+                return cursor.rowcount == 1

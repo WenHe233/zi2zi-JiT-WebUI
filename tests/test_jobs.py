@@ -1,4 +1,5 @@
 import sys
+import threading
 import time
 
 import pytest
@@ -149,5 +150,85 @@ def test_submit_many_does_not_persist_a_partial_invalid_batch(tmp_path):
                 ]
             )
         assert manager.list_jobs() == []
+    finally:
+        manager.stop()
+
+
+def _wait_for_status(manager, job_id, statuses, timeout=10):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        job = manager.get_job(job_id)
+        if job["status"] in statuses:
+            return job
+        time.sleep(0.05)
+    return manager.get_job(job_id)
+
+
+def test_running_job_cancellation_is_not_overwritten_by_worker_exit(tmp_path):
+    storage = Storage(tmp_path / "state")
+    manager = JobManager(storage)
+    try:
+        job_id = manager.submit(
+            "test",
+            [
+                sys.executable,
+                "-u",
+                "-c",
+                "import time; print('started', flush=True); time.sleep(30)",
+            ],
+            cwd=tmp_path,
+        )
+        assert _wait_for_status(manager, job_id, {"running"}).get("status") == "running"
+        assert manager.cancel(job_id)
+        job = _wait_for_status(manager, job_id, {"cancelled"})
+        time.sleep(0.2)
+        assert job["status"] == "cancelled"
+        assert manager.get_job(job_id)["status"] == "cancelled"
+    finally:
+        manager.stop()
+
+
+def test_application_stop_interrupts_running_and_queued_jobs(tmp_path):
+    storage = Storage(tmp_path / "state")
+    manager = JobManager(storage)
+    running = manager.submit(
+        "test",
+        [sys.executable, "-c", "import time; time.sleep(30)"],
+        cwd=tmp_path,
+    )
+    queued = manager.submit(
+        "test",
+        [sys.executable, "-c", "print('should not start')"],
+        cwd=tmp_path,
+    )
+    assert _wait_for_status(manager, running, {"running"}).get("status") == "running"
+    manager.stop()
+    assert manager.get_job(running)["status"] == "interrupted"
+    assert manager.get_job(queued)["status"] == "interrupted"
+
+
+def test_concurrent_job_updates_are_serialized(tmp_path):
+    storage = Storage(tmp_path / "state")
+    manager = JobManager(storage)
+    try:
+        job_id = manager.submit(
+            "test",
+            [sys.executable, "-c", "import time; time.sleep(2)"],
+            cwd=tmp_path,
+        )
+        threads = [
+            threading.Thread(
+                target=lambda index=index: [
+                    manager._update(job_id, progress_text=f"update-{index}-{step}")
+                    for step in range(20)
+                ]
+            )
+            for index in range(6)
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        assert manager.get_job(job_id)["id"] == job_id
     finally:
         manager.stop()

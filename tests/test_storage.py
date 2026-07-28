@@ -1,4 +1,7 @@
 import json
+import sqlite3
+
+import pytest
 
 from zi2zi_webui.models import ProjectManifest, TrainingRun
 from zi2zi_webui.storage import PROJECT_FOLDERS, Storage
@@ -117,3 +120,33 @@ def test_legacy_single_source_font_manifest_migrates_to_ordered_lists():
     assert project.global_source_fonts == ["global.ttf"]
     assert project.regional_source_fonts["SC"] == ["sc.ttf"]
     assert project.source_fonts_for_region("SC") == ["sc.ttf", "global.ttf"]
+
+
+def test_storage_connections_are_explicitly_closed(tmp_path):
+    storage = Storage(tmp_path / "state")
+    with storage._connect() as db:
+        connection = db
+        assert db.execute("SELECT 1").fetchone()[0] == 1
+    with pytest.raises(sqlite3.ProgrammingError):
+        connection.execute("SELECT 1")
+
+
+def test_project_delete_restores_files_when_database_delete_fails(
+    tmp_path,
+    monkeypatch,
+):
+    storage = Storage(tmp_path / "state")
+    project = storage.create_project("Rollback")
+    artifact = storage.project_dir(project.id) / "generation" / "keep.txt"
+    artifact.write_text("keep", encoding="utf-8")
+
+    def fail_delete(_db, _project_id):
+        raise sqlite3.OperationalError("simulated database failure")
+
+    monkeypatch.setattr(storage, "_delete_project_records", fail_delete)
+    with pytest.raises(sqlite3.OperationalError, match="simulated"):
+        storage.delete_project(project.id)
+
+    assert artifact.read_text(encoding="utf-8") == "keep"
+    assert storage.get_project(project.id).name == "Rollback"
+    assert not any(storage.trash_dir.iterdir())

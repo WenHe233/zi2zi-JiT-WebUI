@@ -4,8 +4,10 @@ import json
 import shutil
 import sqlite3
 import threading
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
+from uuid import uuid4
 
 from .models import ProjectManifest, TrainingRun, utc_now
 
@@ -34,19 +36,30 @@ class Storage:
         self.root = Path(root).expanduser().resolve()
         self.models_dir = self.root / "models"
         self.projects_dir = self.root / "projects"
+        self.trash_dir = self.root / ".trash"
         self.root.mkdir(parents=True, exist_ok=True)
         self.models_dir.mkdir(exist_ok=True)
         self.projects_dir.mkdir(exist_ok=True)
+        self.trash_dir.mkdir(exist_ok=True)
         self.db_path = self.root / "state.sqlite3"
         self._lock = threading.RLock()
         self._initialize()
+        self._reconcile_trash()
 
-    def _connect(self) -> sqlite3.Connection:
+    @contextmanager
+    def _connect(self) -> Iterator[sqlite3.Connection]:
         connection = sqlite3.connect(self.db_path, timeout=30, check_same_thread=False)
-        connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA journal_mode=WAL")
-        connection.execute("PRAGMA foreign_keys=ON")
-        return connection
+        try:
+            connection.row_factory = sqlite3.Row
+            connection.execute("PRAGMA journal_mode=WAL")
+            connection.execute("PRAGMA foreign_keys=ON")
+            yield connection
+            connection.commit()
+        except BaseException:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
 
     def _initialize(self) -> None:
         with self._connect() as db:
@@ -110,6 +123,30 @@ class Storage:
                 (utc_now(),),
             )
 
+    def _reconcile_trash(self) -> None:
+        """Recover pre-commit moves and retry post-commit trash cleanup."""
+        with self._lock:
+            for item in self.trash_dir.iterdir():
+                if not item.is_dir() or "--" not in item.name:
+                    continue
+                project_id = item.name.split("--", 1)[0]
+                with self._connect() as db:
+                    exists = db.execute(
+                        "SELECT 1 FROM projects WHERE id=?",
+                        (project_id,),
+                    ).fetchone()
+                try:
+                    original = self.project_dir(project_id)
+                except ValueError:
+                    continue
+                if exists and not original.exists():
+                    item.replace(original)
+                elif not exists:
+                    try:
+                        shutil.rmtree(item)
+                    except OSError:
+                        pass
+
     def project_dir(self, project_id: str) -> Path:
         path = (self.projects_dir / project_id).resolve()
         if self.projects_dir not in path.parents:
@@ -172,6 +209,8 @@ class Storage:
     def delete_project(self, project_id: str) -> ProjectManifest:
         manifest = self.get_project(project_id)
         project_dir = self.project_dir(project_id)
+        trash_path = self.trash_dir / f"{project_id}--{uuid4().hex}"
+        moved = False
         with self._lock, self._connect() as db:
             row = db.execute(
                 "SELECT id FROM projects WHERE id=?",
@@ -194,10 +233,28 @@ class Storage:
                 )
 
             if project_dir.exists():
-                shutil.rmtree(project_dir)
-            db.execute("DELETE FROM jobs WHERE project_id=?", (project_id,))
-            db.execute("DELETE FROM projects WHERE id=?", (project_id,))
+                project_dir.replace(trash_path)
+                moved = True
+            try:
+                self._delete_project_records(db, project_id)
+            except BaseException:
+                if moved and trash_path.exists() and not project_dir.exists():
+                    trash_path.replace(project_dir)
+                raise
+        if moved and trash_path.exists():
+            try:
+                shutil.rmtree(trash_path)
+            except OSError:
+                pass
         return manifest
+
+    def _delete_project_records(
+        self,
+        db: sqlite3.Connection,
+        project_id: str,
+    ) -> None:
+        db.execute("DELETE FROM jobs WHERE project_id=?", (project_id,))
+        db.execute("DELETE FROM projects WHERE id=?", (project_id,))
 
     def save_training_run(self, run: TrainingRun) -> None:
         run.updated_at = utc_now()
