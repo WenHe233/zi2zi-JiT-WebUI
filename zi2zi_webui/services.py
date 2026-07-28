@@ -506,6 +506,8 @@ def training_command(
         str(preset.get("blr", 8e-4)),
         "--warmup_epochs",
         str(preset.get("warmup_epochs", 1)),
+        "--horizontal_flip_prob",
+        str(preset.get("horizontal_flip_prob", 0.0)),
         "--save_last_freq",
         str(preset.get("save_last_freq", 10)),
         "--lora_r",

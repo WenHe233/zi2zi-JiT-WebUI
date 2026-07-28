@@ -166,3 +166,21 @@ def test_review_and_export_pages_select_generation_batches(tmp_path):
         assert "Generated glyph directory" not in labels
     finally:
         jobs.stop()
+
+
+def test_training_page_defaults_horizontal_flip_off(tmp_path):
+    storage = Storage(tmp_path / "state")
+    jobs = JobManager(storage)
+    try:
+        app = build_app(storage, jobs, language="en")
+        slider = next(
+            block
+            for block in app.blocks.values()
+            if getattr(block, "label", "")
+            == "Horizontal flip probability (normally 0 for CJK)"
+        )
+        assert slider.value == 0.0
+        assert slider.minimum == 0.0
+        assert slider.maximum == 0.5
+    finally:
+        jobs.stop()

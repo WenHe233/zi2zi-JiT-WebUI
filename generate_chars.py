@@ -33,10 +33,10 @@ from pathlib import Path
 import torch
 import torch.distributed as dist
 import numpy as np
-import cv2
 
 import util.misc as misc
 from util.lora_utils import inject_lora, _is_lora_state_dict
+from util.image_io import imwrite_unicode
 from data_processing.font_utils import GlyphRendererPool
 from zi2zi_webui.inference import _style_image
 
@@ -568,17 +568,17 @@ def main(args):
             gen_img = gen_img.astype(np.uint8)[:, :, ::-1]  # RGB -> BGR
 
             # Save generated-only image
-            cv2.imwrite(os.path.join(gen_folder, f'{filename}.png'), gen_img)
+            imwrite_unicode(os.path.join(gen_folder, f'{filename}.png'), gen_img)
 
             # Save pairwise comparison if requested
             if args.pairwise == 'src_gen':
                 src_img = sample['content_image'].transpose([1, 2, 0])[:, :, ::-1]  # RGB -> BGR
                 pair_img = np.concatenate([src_img, gen_img], axis=1)
-                cv2.imwrite(os.path.join(compare_folder, f'{filename}.png'), pair_img)
+                imwrite_unicode(os.path.join(compare_folder, f'{filename}.png'), pair_img)
             elif args.pairwise == 'target_gen':
                 target_img = sample['target_image'].transpose([1, 2, 0])[:, :, ::-1]  # RGB -> BGR
                 pair_img = np.concatenate([target_img, gen_img], axis=1)
-                cv2.imwrite(os.path.join(compare_folder, f'{filename}.png'), pair_img)
+                imwrite_unicode(os.path.join(compare_folder, f'{filename}.png'), pair_img)
         if local_rank == 0:
             current = min((step + 1) * batch_size * world_size, num_images)
             print(

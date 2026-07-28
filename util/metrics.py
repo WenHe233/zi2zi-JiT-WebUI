@@ -20,6 +20,7 @@ import tempfile
 import torch
 import numpy as np
 import cv2
+from util.image_io import imwrite_unicode
 from pytorch_msssim import ssim as _ssim_fn
 import lpips
 import torch_fidelity
@@ -45,7 +46,7 @@ def _save_tensors_to_dir(images, out_dir):
     images_np = (images * 255).clamp(0, 255).byte().permute(0, 2, 3, 1).numpy()
     for i, img in enumerate(images_np):
         # RGB -> BGR for cv2
-        cv2.imwrite(os.path.join(out_dir, f"{i:06d}.png"), img[:, :, ::-1])
+        imwrite_unicode(os.path.join(out_dir, f"{i:06d}.png"), img[:, :, ::-1])
 
 
 def compute_fid(images_real, images_gen, device="cpu", batch_size=64):

@@ -26,6 +26,8 @@ import util.misc as misc
 
 
 def main(args):
+    if not 0.0 <= args.horizontal_flip_prob <= 0.5:
+        raise ValueError("--horizontal_flip_prob must be between 0.0 and 0.5")
     misc.init_distributed_mode(args)
     print("Job directory:", os.path.dirname(os.path.realpath(__file__)))
     print("Arguments:\n{}".format(args).replace(", ", ",\n"))
@@ -49,7 +51,7 @@ def main(args):
 
     transform_train = transforms.Compose([
         ResizeAndRandomCrop(args.img_size),
-        transforms.RandomHorizontalFlip(),
+        transforms.RandomHorizontalFlip(p=args.horizontal_flip_prob),
         transforms.PILToTensor()
     ])
 

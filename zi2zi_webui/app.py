@@ -366,11 +366,24 @@ def build_app(
         except ValueError:
             return ""
 
-    def queue_training(project_id, dataset_path, device, quality, epochs):
+    def queue_training(
+        project_id,
+        dataset_path,
+        device,
+        quality,
+        epochs,
+        horizontal_flip_prob,
+    ):
         project = storage.get_project(project_id)
         if not project.base_model:
             raise gr.Error("Import or download and attach a base model first")
-        overrides: dict[str, Any] = {"epochs": int(epochs)}
+        flip_probability = float(horizontal_flip_prob)
+        if not 0.0 <= flip_probability <= 0.5:
+            raise gr.Error("Horizontal flip probability must be between 0.0 and 0.5")
+        overrides: dict[str, Any] = {
+            "epochs": int(epochs),
+            "horizontal_flip_prob": flip_probability,
+        }
         try:
             metadata = read_checkpoint_sidecar(project.base_model)
         except (FileNotFoundError, OSError, ValueError) as exc:
@@ -407,7 +420,14 @@ def build_app(
             f"Queued training run {run.id}; job {job_id}; architecture {model_variant}",
         )
 
-    def resume_training(project_id, run_ids, dataset_path, device, epochs):
+    def resume_training(
+        project_id,
+        run_ids,
+        dataset_path,
+        device,
+        epochs,
+        horizontal_flip_prob,
+    ):
         selected_id = (run_ids or [None])[0]
         parent = next(
             (item for item in project_runs(project_id) if item["id"] == selected_id),
@@ -428,6 +448,10 @@ def build_app(
             raise gr.Error("The original dataset path is unavailable")
         overrides = dict(parent.get("parameters", {}))
         overrides["epochs"] = int(epochs)
+        flip_probability = float(horizontal_flip_prob)
+        if not 0.0 <= flip_probability <= 0.5:
+            raise gr.Error("Horizontal flip probability must be between 0.0 and 0.5")
+        overrides["horizontal_flip_prob"] = flip_probability
         run, command = training_command(
             storage.get_project(project_id),
             storage,
@@ -1371,6 +1395,20 @@ def build_app(
                     label=b("训练预设", "Preset"),
                 )
                 epochs = gr.Number(value=200, precision=0, label="Epoch")
+            with gr.Accordion(
+                b("高级训练设置", "Advanced training settings"),
+                open=False,
+            ):
+                horizontal_flip_prob = gr.Slider(
+                    0.0,
+                    0.5,
+                    value=0.0,
+                    step=0.05,
+                    label=b(
+                        "水平镜像概率（汉字通常保持 0）",
+                        "Horizontal flip probability (normally 0 for CJK)",
+                    ),
+                )
             queue_training_btn = gr.Button(b("开始 LoRA 训练", "Start LoRA training"), variant="primary")
             resume_training_btn = gr.Button(
                 b("从所选 run 的 last checkpoint 续训", "Resume selected run from last checkpoint")
@@ -1669,12 +1707,26 @@ def build_app(
         )
         queue_training_btn.click(
             queue_training,
-            [project_selector, dataset_path, training_device, quality, epochs],
+            [
+                project_selector,
+                dataset_path,
+                training_device,
+                quality,
+                epochs,
+                horizontal_flip_prob,
+            ],
             [training_run_id, training_status],
         )
         resume_training_btn.click(
             resume_training,
-            [project_selector, run_selector, dataset_path, training_device, epochs],
+            [
+                project_selector,
+                run_selector,
+                dataset_path,
+                training_device,
+                epochs,
+                horizontal_flip_prob,
+            ],
             [training_run_id, training_status],
         )
         delete_run_btn.click(

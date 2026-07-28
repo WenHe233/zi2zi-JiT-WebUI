@@ -4,7 +4,7 @@ import os
 
 import torch
 import numpy as np
-import cv2
+from util.image_io import imwrite_unicode
 
 import util.misc as misc
 import util.lr_sched as lr_sched
@@ -168,7 +168,7 @@ def evaluate(model_without_ddp, args, epoch, batch_size=64, log_writer=None):
                 continue
             gen_img = np.round(np.clip(sampled_images[b_id].numpy().transpose([1, 2, 0]) * 255, 0, 255))
             gen_img = gen_img.astype(np.uint8)[:, :, ::-1]
-            cv2.imwrite(os.path.join(gen_folder, '{}.png'.format(str(img_id).zfill(5))), gen_img)
+            imwrite_unicode(os.path.join(gen_folder, '{}.png'.format(str(img_id).zfill(5))), gen_img)
 
             target_img = target_images_all[img_id].transpose([1, 2, 0])
             target_img = target_img[:, :, ::-1]
@@ -184,7 +184,7 @@ def evaluate(model_without_ddp, args, epoch, batch_size=64, log_writer=None):
                     row = np.concatenate([left_pair, right_pair], axis=1)
                     rows.append(row)
                 grid_img = np.concatenate(rows, axis=0)
-                cv2.imwrite(os.path.join(save_folder, 'grid_{}.png'.format(str(grid_id).zfill(5))), grid_img)
+                imwrite_unicode(os.path.join(save_folder, 'grid_{}.png'.format(str(grid_id).zfill(5))), grid_img)
                 pairs_buffer = []
 
         if len(pairs_buffer) > 0:
@@ -199,7 +199,7 @@ def evaluate(model_without_ddp, args, epoch, batch_size=64, log_writer=None):
                 row = np.concatenate([left_pair, right_pair], axis=1)
                 rows.append(row)
             grid_img = np.concatenate(rows, axis=0)
-            cv2.imwrite(os.path.join(save_folder, 'grid_{}.png'.format(str(grid_id).zfill(5))), grid_img)
+            imwrite_unicode(os.path.join(save_folder, 'grid_{}.png'.format(str(grid_id).zfill(5))), grid_img)
 
     torch.distributed.barrier()
 
@@ -407,7 +407,7 @@ def evaluate_single_gpu(
                 continue
             gen_img = np.round(np.clip(sampled_images[b_id].numpy().transpose([1, 2, 0]) * 255, 0, 255))
             gen_img = gen_img.astype(np.uint8)[:, :, ::-1]
-            cv2.imwrite(os.path.join(gen_folder, '{}.png'.format(str(img_id).zfill(5))), gen_img)
+            imwrite_unicode(os.path.join(gen_folder, '{}.png'.format(str(img_id).zfill(5))), gen_img)
 
             target_img = target_images_all[img_id].transpose([1, 2, 0])
             target_img = target_img[:, :, ::-1]
@@ -423,7 +423,7 @@ def evaluate_single_gpu(
                     row = np.concatenate([left_pair, right_pair], axis=1)
                     rows.append(row)
                 grid_img = np.concatenate(rows, axis=0)
-                cv2.imwrite(os.path.join(save_folder, 'grid_{}.png'.format(str(grid_id).zfill(5))), grid_img)
+                imwrite_unicode(os.path.join(save_folder, 'grid_{}.png'.format(str(grid_id).zfill(5))), grid_img)
                 pairs_buffer = []
 
         if len(pairs_buffer) > 0:
@@ -438,7 +438,7 @@ def evaluate_single_gpu(
                 row = np.concatenate([left_pair, right_pair], axis=1)
                 rows.append(row)
             grid_img = np.concatenate(rows, axis=0)
-            cv2.imwrite(os.path.join(save_folder, 'grid_{}.png'.format(str(grid_id).zfill(5))), grid_img)
+            imwrite_unicode(os.path.join(save_folder, 'grid_{}.png'.format(str(grid_id).zfill(5))), grid_img)
 
     results = {'snapshot_path': save_folder, 'num_images': num_images}
     if compute_full_metrics:

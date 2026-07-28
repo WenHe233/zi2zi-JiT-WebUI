@@ -159,6 +159,12 @@ def get_args_parser():
     parser.add_argument('--noise_scale', default=1.0, type=float)
     parser.add_argument('--t_eps', default=5e-2, type=float)
     parser.add_argument('--label_drop_prob', default=0.1, type=float)
+    parser.add_argument(
+        '--horizontal_flip_prob',
+        default=0.0,
+        type=float,
+        help='Synchronized source/target horizontal flip probability (0.0-0.5)',
+    )
 
     parser.add_argument('--seed', default=0, type=int)
     parser.add_argument('--start_epoch', default=0, type=int, metavar='N',
@@ -227,6 +233,8 @@ def get_args_parser():
 
 
 def main(args):
+    if not 0.0 <= args.horizontal_flip_prob <= 0.5:
+        raise ValueError("--horizontal_flip_prob must be between 0.0 and 0.5")
     misc.init_distributed_mode(args)
     print('Job directory:', os.path.dirname(os.path.realpath(__file__)))
     print("Arguments:\n{}".format(args).replace(', ', ',\n'))
@@ -253,7 +261,7 @@ def main(args):
     # Data augmentation transforms
     transform_train = transforms.Compose([
         ResizeAndRandomCrop(args.img_size),
-        transforms.RandomHorizontalFlip(),
+        transforms.RandomHorizontalFlip(p=args.horizontal_flip_prob),
         transforms.PILToTensor()
     ])
 

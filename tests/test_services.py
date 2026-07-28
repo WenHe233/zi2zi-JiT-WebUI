@@ -17,8 +17,10 @@ from zi2zi_webui.services import (
     infer_checkpoint_model,
     resolve_generation_checkpoint,
     resolve_training_dataset,
+    training_command,
     validate_checkpoint,
 )
+from zi2zi_webui.devices import DeviceInfo
 from zi2zi_webui.font_builder import FontMetadata, build_ttf
 from zi2zi_webui.models import TrainingRun
 from zi2zi_webui.storage import Storage
@@ -251,6 +253,37 @@ def test_single_epoch_training_always_saves_last_checkpoint():
     assert periodic_or_final(epoch=0, total_epochs=1, frequency=10)
     assert not periodic_or_final(epoch=0, total_epochs=10, frequency=10)
     assert periodic_or_final(epoch=9, total_epochs=200, frequency=10)
+
+
+def test_training_command_records_explicit_horizontal_flip_probability(
+    tmp_path,
+    monkeypatch,
+):
+    storage = Storage(tmp_path / "state")
+    project = storage.create_project("Augmentation")
+    project.base_model = str(tmp_path / "base.pth")
+    dataset = storage.project_dir(project.id) / "datasets" / "legacy"
+    (dataset / "train").mkdir(parents=True)
+    (dataset / "test.npz").touch()
+    monkeypatch.setattr(
+        "zi2zi_webui.services.detect_devices",
+        lambda: [DeviceInfo("0", "Test GPU", "cuda", 16, True)],
+    )
+
+    run, command = training_command(
+        project,
+        storage,
+        dataset,
+        "0",
+        "balanced",
+        {
+            "model": "JiT-B/16",
+            "horizontal_flip_prob": 0.25,
+        },
+    )
+
+    assert run.parameters["horizontal_flip_prob"] == 0.25
+    assert command[command.index("--horizontal_flip_prob") + 1] == "0.25"
 
 
 def test_dataset_size_presets_and_generated_sample_count(tmp_path):
