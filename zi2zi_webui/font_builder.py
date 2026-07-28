@@ -11,7 +11,8 @@ import xml.etree.ElementTree as ET
 import zipfile
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Callable
+from statistics import median
+from typing import Callable, TypeVar
 
 import cv2
 import numpy as np
@@ -25,11 +26,12 @@ from fontTools.svgLib.path import parse_path
 from fontTools.ttLib import TTFont
 from fontTools.ttLib.tables._c_m_a_p import CmapSubtable
 
-from data_processing.font_utils import get_preserved_codepoints
+from data_processing.font_utils import get_preserved_codepoints, is_cjk_codepoint
 
 
 ATTRIBUTION = "Created using zi2zi-JiT artifacts"
 UPSTREAM_URL = "https://github.com/kaonashi-tyc/zi2zi-JiT"
+T = TypeVar("T")
 
 
 @dataclass
@@ -49,16 +51,25 @@ class FontMetadata:
     license_description: str = ""
 
 
+@dataclass(frozen=True)
+class CJKLayout:
+    scale: float
+    center_x: float
+    center_y: float
+    advance: int
+    base_sample_count: int
+    image_sample_count: int
+
+
 def codepoint_from_filename(path: str | Path) -> int | None:
     match = re.search(r"(?:U\+|uni|u)([0-9A-Fa-f]{4,6})", Path(path).stem)
     return int(match.group(1), 16) if match else None
 
 
-def preprocess_glyph(
+def _glyph_bitmap(
     source: str | Path,
-    destination: str | Path,
     options: VectorizeOptions | None = None,
-) -> dict:
+) -> tuple[np.ndarray, dict]:
     options = options or VectorizeOptions()
     try:
         with Image.open(source) as image:
@@ -75,21 +86,30 @@ def preprocess_glyph(
             if stats[label, cv2.CC_STAT_AREA] >= options.despeckle_area:
                 cleaned[labels == label] = 255
         bitmap = cleaned
-    destination = Path(destination)
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    Image.fromarray(255 - bitmap).save(destination, format="PNG")
     contours, hierarchy = cv2.findContours(bitmap, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
     ink = np.where(bitmap > 0)
     bbox = None
     if len(ink[0]):
         bbox = [int(ink[1].min()), int(ink[0].min()), int(ink[1].max()), int(ink[0].max())]
-    return {
+    return bitmap, {
         "contours": len(contours),
         "has_holes": bool(hierarchy is not None and np.any(hierarchy[0, :, 3] >= 0)),
         "ink_ratio": round(float((bitmap > 0).mean()), 5),
         "bbox": bbox,
         "empty": not contours,
     }
+
+
+def preprocess_glyph(
+    source: str | Path,
+    destination: str | Path,
+    options: VectorizeOptions | None = None,
+) -> dict:
+    bitmap, qa = _glyph_bitmap(source, options)
+    destination = Path(destination)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    Image.fromarray(255 - bitmap).save(destination, format="PNG")
+    return qa
 
 
 def vectorize_png(
@@ -232,6 +252,81 @@ def _glyph_from_svg(
     if not found:
         raise ValueError(f"No SVG path in {svg_path}")
     return pen.glyph()
+
+
+def _percentile(values: list[float], fraction: float) -> float:
+    ordered = sorted(values)
+    return ordered[round((len(ordered) - 1) * fraction)]
+
+
+def _sample_evenly(items: list[T], limit: int) -> list[T]:
+    if len(items) <= limit:
+        return items
+    return [items[index * (len(items) - 1) // (limit - 1)] for index in range(limit)]
+
+
+def _cjk_layout(
+    base_font: TTFont,
+    images: list[tuple[int, str | Path]],
+    options: VectorizeOptions,
+) -> CJKLayout | None:
+    cmap = base_font.getBestCmap() or {}
+    glyf = base_font["glyf"]
+    hmtx = base_font["hmtx"]
+    base_bounds: list[tuple[float, float, float, float, int]] = []
+    for codepoint, glyph_name in cmap.items():
+        if not is_cjk_codepoint(codepoint) or glyph_name not in glyf:
+            continue
+        glyph = glyf[glyph_name]
+        if glyph.numberOfContours == 0:
+            continue
+        width = glyph.xMax - glyph.xMin
+        height = glyph.yMax - glyph.yMin
+        advance = hmtx[glyph_name][0]
+        if width > 0 and height > 0 and advance > 0:
+            base_bounds.append(
+                (
+                    width,
+                    height,
+                    (glyph.xMin + glyph.xMax) / 2,
+                    (glyph.yMin + glyph.yMax) / 2,
+                    advance,
+                )
+            )
+    image_bounds: list[tuple[float, float]] = []
+    candidates = [item for item in images if is_cjk_codepoint(item[0])]
+    for _, image_path in _sample_evenly(candidates, 256):
+        try:
+            _, qa = _glyph_bitmap(image_path, options)
+        except (OSError, ValueError):
+            continue
+        bbox = qa.get("bbox")
+        if bbox:
+            image_bounds.append((bbox[2] - bbox[0] + 1, bbox[3] - bbox[1] + 1))
+    if len(base_bounds) < 8 or len(image_bounds) < 8:
+        return None
+
+    base_widths = [item[0] for item in base_bounds]
+    base_heights = [item[1] for item in base_bounds]
+    image_widths = [item[0] for item in image_bounds]
+    image_heights = [item[1] for item in image_bounds]
+    median_scale = math.sqrt(
+        (median(base_widths) / median(image_widths))
+        * (median(base_heights) / median(image_heights))
+    )
+    scale = min(
+        median_scale,
+        _percentile(base_widths, 0.9) / _percentile(image_widths, 0.9),
+        _percentile(base_heights, 0.9) / _percentile(image_heights, 0.9),
+    )
+    return CJKLayout(
+        scale=scale,
+        center_x=median([item[2] for item in base_bounds]),
+        center_y=median([item[3] for item in base_bounds]),
+        advance=int(round(median([item[4] for item in base_bounds]))),
+        base_sample_count=len(base_bounds),
+        image_sample_count=len(image_bounds),
+    )
 
 
 def _glyph_name(codepoint: int, used_names: set[str]) -> str:
@@ -389,6 +484,12 @@ def build_ttf(
         if base_font is not None:
             base_font.close()
         raise ValueError("The font would exceed the TrueType 65,535 glyph limit")
+    options = vectorize_options or VectorizeOptions()
+    cjk_layout = (
+        _cjk_layout(base_font, ordered_images, options)
+        if base_font is not None
+        else None
+    )
     report = {
         "included": [],
         "failed": [],
@@ -402,6 +503,7 @@ def build_ttf(
         "metrics_profile": metrics_profile,
         "base_font": str(Path(base_font_path).resolve()) if base_font_path else "",
         "base_glyph_count": len(glyph_order) if base_font is not None else 0,
+        "cjk_layout": asdict(cjk_layout) if cjk_layout is not None else None,
     }
 
     used_names = set(glyph_order)
@@ -410,7 +512,6 @@ def build_ttf(
         glyph_name = _glyph_name(codepoint, used_names)
         svg_path = svg_dir / f"U+{codepoint:04X}.svg"
         try:
-            options = vectorize_options or VectorizeOptions()
             cache_path = svg_path.with_suffix(".source.json")
             digest = hashlib.sha256()
             digest.update(Path(image_path).read_bytes())
@@ -431,7 +532,19 @@ def build_ttf(
             bbox = qa.get("bbox") or [0, 0, 255, 255]
             base_scale = (upm * 0.9) / 256
             margin = upm * 0.05
-            if codepoint < 0x0250 and metrics_profile == "monospace-2to1":
+            if cjk_layout is not None and is_cjk_codepoint(codepoint):
+                x_scale = cjk_layout.scale
+                y_scale = cjk_layout.scale
+                advance = cjk_layout.advance
+                x_offset = (
+                    cjk_layout.center_x
+                    - ((bbox[0] + bbox[2]) / 2) * x_scale
+                )
+                y_offset = (
+                    cjk_layout.center_y
+                    + ((bbox[1] + bbox[3]) / 2) * y_scale
+                )
+            elif codepoint < 0x0250 and metrics_profile == "monospace-2to1":
                 advance = max(1, int(round(upm / 2)))
                 side_margin = upm * 0.04
                 x_scale = min(
@@ -440,6 +553,8 @@ def build_ttf(
                     base_scale,
                 )
                 x_offset = side_margin - bbox[0] * x_scale
+                y_scale = base_scale
+                y_offset = upm * 0.85
             elif codepoint < 0x0250:
                 x_scale = base_scale
                 ink_width = (bbox[2] - bbox[0] + 1) * x_scale
@@ -447,20 +562,26 @@ def build_ttf(
                     max(upm * 0.3, min(upm * 0.9, ink_width + upm * 0.12))
                 )
                 x_offset = upm * 0.06 - bbox[0] * x_scale
+                y_scale = base_scale
+                y_offset = upm * 0.85
             else:
                 x_scale = base_scale
                 advance = upm
                 x_offset = margin
+                y_scale = base_scale
+                y_offset = upm * 0.85
             transform = (
                 x_scale,
                 0,
                 0,
-                -base_scale,
+                -y_scale,
                 x_offset,
-                upm * 0.85,
+                y_offset,
             )
-            glyphs[glyph_name] = _glyph_from_svg(svg_path, transform)
-            metrics[glyph_name] = (advance, max(0, int(x_offset)))
+            glyph = _glyph_from_svg(svg_path, transform)
+            glyph.recalcBounds(None)
+            glyphs[glyph_name] = glyph
+            metrics[glyph_name] = (advance, glyph.xMin)
             character_map[codepoint] = glyph_name
             glyph_order.append(glyph_name)
             used_names.add(glyph_name)

@@ -1,4 +1,5 @@
 from pathlib import Path
+from statistics import median
 
 from PIL import Image, ImageDraw
 from fontTools.pens.ttGlyphPen import TTGlyphPen
@@ -21,11 +22,11 @@ from zi2zi_webui.inference import (
 )
 
 
-def _glyph(path: Path):
+def _glyph(path: Path, outer=(45, 35, 210, 220), inner=(90, 80, 165, 175)):
     image = Image.new("L", (256, 256), "white")
     draw = ImageDraw.Draw(image)
-    draw.rectangle((45, 35, 210, 220), fill="black")
-    draw.rectangle((90, 80, 165, 175), fill="white")
+    draw.rectangle(outer, fill="black")
+    draw.rectangle(inner, fill="white")
     image.convert("RGB").save(path)
 
 
@@ -230,6 +231,57 @@ def test_target_font_existing_glyphs_are_skipped_and_missing_glyphs_are_merged(t
     assert "Original target license" in merged_license
     assert "Additional generated-glyph notice" in merged_license
     merged.close()
+
+
+def test_generated_cjk_layout_matches_base_font_size_center_and_advance(tmp_path):
+    base_image = tmp_path / "base.png"
+    generated_image = tmp_path / "generated.png"
+    _glyph(base_image, outer=(40, 40, 215, 215), inner=(90, 90, 165, 165))
+    _glyph(generated_image, outer=(75, 75, 180, 180), inner=(105, 105, 150, 150))
+    base_path = tmp_path / "Base.ttf"
+    base_codepoints = range(0x4E00, 0x4E08)
+    generated_codepoints = range(0x4E10, 0x4E18)
+    build_ttf(
+        {codepoint: base_image for codepoint in base_codepoints},
+        base_path,
+        FontMetadata(family_name="Base"),
+    )
+
+    output = tmp_path / "Extended.ttf"
+    report = build_ttf(
+        {codepoint: generated_image for codepoint in generated_codepoints},
+        output,
+        FontMetadata(family_name="Extended"),
+        base_font_path=base_path,
+    )
+
+    assert report["cjk_layout"] is not None
+    font = TTFont(output)
+    cmap = font.getBestCmap()
+
+    def layout(codepoints):
+        rows = []
+        for codepoint in codepoints:
+            name = cmap[codepoint]
+            glyph = font["glyf"][name]
+            rows.append(
+                (
+                    glyph.xMax - glyph.xMin,
+                    glyph.yMax - glyph.yMin,
+                    (glyph.xMin + glyph.xMax) / 2,
+                    (glyph.yMin + glyph.yMax) / 2,
+                    font["hmtx"][name][0],
+                )
+            )
+        return tuple(median(item[index] for item in rows) for index in range(5))
+
+    base_layout = layout(base_codepoints)
+    generated_layout = layout(generated_codepoints)
+    assert generated_layout[:2] == base_layout[:2]
+    assert abs(generated_layout[2] - base_layout[2]) <= 4
+    assert abs(generated_layout[3] - base_layout[3]) <= 4
+    assert generated_layout[4] == base_layout[4]
+    font.close()
 
 
 def test_incremental_packaging_can_export_an_unchanged_base_font(tmp_path):
