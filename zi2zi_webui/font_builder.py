@@ -3,6 +3,7 @@ from __future__ import annotations
 import html
 import hashlib
 import json
+import math
 import re
 import shutil
 import tempfile
@@ -16,6 +17,7 @@ import cv2
 import numpy as np
 from PIL import Image
 from fontTools.fontBuilder import FontBuilder
+from fontTools.misc.transform import Transform
 from fontTools.pens.cu2quPen import Cu2QuPen
 from fontTools.pens.transformPen import TransformPen
 from fontTools.pens.ttGlyphPen import TTGlyphPen
@@ -152,16 +154,81 @@ def _opencv_svg(source: str | Path, destination: str | Path) -> None:
     )
 
 
-def _glyph_from_svg(svg_path: Path, transform: tuple[float, float, float, float, float, float]):
+_SVG_TRANSFORM_RE = re.compile(r"([A-Za-z]+)\s*\(([^)]*)\)")
+_SVG_NUMBER_RE = re.compile(
+    r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[Ee][-+]?\d+)?"
+)
+
+
+def _svg_transform(value: str) -> Transform:
+    result = Transform()
+    position = 0
+    for match in _SVG_TRANSFORM_RE.finditer(value):
+        if value[position : match.start()].strip(" ,\t\r\n"):
+            raise ValueError(f"Invalid SVG transform: {value}")
+        name = match.group(1).lower()
+        values = [float(item) for item in _SVG_NUMBER_RE.findall(match.group(2))]
+        if name == "matrix" and len(values) == 6:
+            operation = Transform(*values)
+        elif name == "translate" and len(values) in {1, 2}:
+            operation = Transform().translate(
+                values[0],
+                values[1] if len(values) == 2 else 0,
+            )
+        elif name == "scale" and len(values) in {1, 2}:
+            operation = Transform().scale(
+                values[0],
+                values[1] if len(values) == 2 else None,
+            )
+        elif name == "rotate" and len(values) in {1, 3}:
+            angle = math.radians(values[0])
+            if len(values) == 3:
+                operation = (
+                    Transform()
+                    .translate(values[1], values[2])
+                    .rotate(angle)
+                    .translate(-values[1], -values[2])
+                )
+            else:
+                operation = Transform().rotate(angle)
+        elif name == "skewx" and len(values) == 1:
+            operation = Transform().skew(math.radians(values[0]), 0)
+        elif name == "skewy" and len(values) == 1:
+            operation = Transform().skew(0, math.radians(values[0]))
+        else:
+            raise ValueError(f"Unsupported SVG transform: {match.group(0)}")
+        result = result.transform(operation)
+        position = match.end()
+    if not position or value[position:].strip(" ,\t\r\n"):
+        raise ValueError(f"Invalid SVG transform: {value}")
+    return result
+
+
+def _glyph_from_svg(
+    svg_path: Path,
+    transform: tuple[float, float, float, float, float, float],
+):
     root = ET.parse(svg_path).getroot()
     pen = TTGlyphPen(None)
     quadratic = Cu2QuPen(pen, max_err=1.0, all_quadratic=True)
     transformed = TransformPen(quadratic, transform)
+    # VTracer places each contour in its own local coordinate system and
+    # restores its canvas position with SVG transform attributes. Parsing only
+    # the path's ``d`` value collapses every contour around the origin.
     found = False
-    for element in root.iter():
+
+    def draw(element: ET.Element, inherited: Transform) -> None:
+        nonlocal found
+        current = inherited
+        if element.attrib.get("transform"):
+            current = inherited.transform(_svg_transform(element.attrib["transform"]))
         if element.tag.endswith("path") and element.attrib.get("d"):
-            parse_path(element.attrib["d"], transformed)
+            parse_path(element.attrib["d"], TransformPen(transformed, current))
             found = True
+        for child in element:
+            draw(child, current)
+
+    draw(root, Transform())
     if not found:
         raise ValueError(f"No SVG path in {svg_path}")
     return pen.glyph()

@@ -8,6 +8,7 @@ from data_processing.font_utils import GlyphRendererPool, get_preserved_codepoin
 from zi2zi_webui.font_builder import (
     ATTRIBUTION,
     FontMetadata,
+    _glyph_from_svg,
     build_export_package,
     build_ttf,
     codepoint_from_filename,
@@ -91,6 +92,23 @@ def test_vectorization_falls_back_when_vtracer_panics(tmp_path, monkeypatch):
     assert svg.is_file()
     assert report["vectorizer"] == "opencv-fallback"
     assert "SimulatedPanic" in report["vectorizer_warning"]
+
+
+def test_svg_path_and_group_transforms_are_preserved(tmp_path):
+    svg = tmp_path / "transformed.svg"
+    svg.write_text(
+        '<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256">'
+        '<g transform="translate(40, 30)">'
+        '<path d="M0 0 L20 0 L20 10 L0 10 Z" '
+        'transform="translate(60, 20)"/>'
+        "</g></svg>",
+        encoding="utf-8",
+    )
+
+    glyph = _glyph_from_svg(svg, (1, 0, 0, 1, 0, 0))
+    glyph.recalcBounds(None)
+
+    assert (glyph.xMin, glyph.yMin, glyph.xMax, glyph.yMax) == (100, 50, 120, 60)
 
 
 def test_mapped_whitespace_is_preserved_without_an_outline(tmp_path):
