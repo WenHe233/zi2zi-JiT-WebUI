@@ -12,6 +12,11 @@ import numpy as np
 import torch
 import torch.distributed as dist
 
+from zi2zi_webui.checkpoints import (
+    create_checkpoint_metadata,
+    write_checkpoint_sidecar,
+)
+
 
 class SmoothedValue(object):
     """Track a series of values and provide access to smoothed values over a
@@ -255,6 +260,23 @@ def add_weight_decay(model, weight_decay=0, skip_list=()):
         {'params': decay, 'weight_decay': weight_decay}]
 
 
+def _write_training_checkpoint_sidecar(checkpoint_path, args, state_dict):
+    if not is_main_process():
+        return
+    metadata = create_checkpoint_metadata(
+        checkpoint_path,
+        architecture=args.model,
+        num_fonts=getattr(args, "num_fonts", None),
+        num_chars=getattr(args, "num_chars", None),
+        img_size=getattr(args, "img_size", None),
+        lora=any(".base.weight" in key for key in state_dict),
+        state_keys=len(state_dict),
+        source="training",
+        trusted_required=False,
+    )
+    write_checkpoint_sidecar(checkpoint_path, metadata)
+
+
 def save_model(args, model_without_ddp, optimizer, epoch, epoch_name=None):
     if epoch_name is None:
         epoch_name = str(epoch)
@@ -279,6 +301,7 @@ def save_model(args, model_without_ddp, optimizer, epoch, epoch_name=None):
     to_save['model_ema2'] = ema_state_dict2
 
     save_on_master(to_save, checkpoint_path)
+    _write_training_checkpoint_sidecar(checkpoint_path, args, to_save["model"])
 
 
 def all_reduce_mean(x):
@@ -320,3 +343,4 @@ def save_model_no_ema(
     if training_state is not None:
         to_save['training_state'] = training_state
     save_on_master(to_save, checkpoint_path)
+    _write_training_checkpoint_sidecar(checkpoint_path, args, to_save["model"])

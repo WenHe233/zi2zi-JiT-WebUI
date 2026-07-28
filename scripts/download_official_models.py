@@ -8,7 +8,9 @@ from pathlib import Path
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Download a verified-by-name official zi2zi-JiT model.")
+    parser = argparse.ArgumentParser(
+        description="Download a named model from the official zi2zi-JiT folder."
+    )
     parser.add_argument("--folder-url", required=True)
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--expected", required=True)
@@ -34,7 +36,21 @@ def main() -> None:
             raise SystemExit(f"Expected model was not found in official folder: {args.expected}")
         destination = output_dir / args.expected
         shutil.copy2(matches[0], destination)
-        print(f"Downloaded {destination}", flush=True)
+        from zi2zi_webui.checkpoints import write_checkpoint_sidecar
+        from zi2zi_webui.services import validate_checkpoint
+
+        metadata = validate_checkpoint(destination)
+        metadata["source"] = "official-folder-download"
+        metadata["provenance_note"] = (
+            "SHA-256 was calculated after download for local auditing only; "
+            "no trusted upstream digest was available for authenticity verification."
+        )
+        sidecar = write_checkpoint_sidecar(destination, metadata)
+        print(
+            f"Downloaded {destination}; audit metadata: {sidecar}; "
+            f"SHA-256: {metadata['sha256']}",
+            flush=True,
+        )
 
 
 if __name__ == "__main__":

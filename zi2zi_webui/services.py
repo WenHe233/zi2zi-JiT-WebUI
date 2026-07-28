@@ -2,13 +2,17 @@ from __future__ import annotations
 
 import json
 import hashlib
-import re
 import shutil
 import sys
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+from .checkpoints import (
+    create_checkpoint_metadata,
+    read_checkpoint_sidecar,
+    write_checkpoint_sidecar,
+)
 from .devices import detect_devices, training_preset
 from .jobs import JobManager
 from .models import ProjectManifest, TrainingRun
@@ -158,15 +162,16 @@ def clamp_training_retry_command(
 
 
 def infer_checkpoint_model(path: str | Path, metadata: dict[str, Any] | None = None) -> str | None:
-    metadata = metadata or {}
-    configured = str(metadata.get("model") or "")
+    if metadata is None:
+        try:
+            metadata = read_checkpoint_sidecar(path)
+        except (FileNotFoundError, OSError, ValueError):
+            metadata = {}
+    configured = str(
+        metadata.get("architecture") or metadata.get("model") or ""
+    )
     if configured in OFFICIAL_MODELS:
         return configured
-    name = Path(path).name.lower()
-    if re.search(r"(?:jit|^)[-_]?l(?:[-_.]|$)", name):
-        return "JiT-L/16"
-    if re.search(r"(?:jit|^)[-_]?b(?:[-_.]|$)", name):
-        return "JiT-B/16"
     return None
 
 
@@ -201,8 +206,7 @@ def import_model(storage: Storage, source: str | Path, trusted: bool = False) ->
     if source != destination:
         shutil.copy2(source, destination)
     metadata = validate_checkpoint(destination)
-    metadata_path = destination.with_suffix(destination.suffix + ".json")
-    metadata_path.write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
+    write_checkpoint_sidecar(destination, metadata)
     return metadata
 
 
@@ -218,23 +222,70 @@ def validate_checkpoint(path: str | Path) -> dict[str, Any]:
             state_dict = checkpoint
     if not isinstance(state_dict, dict):
         raise ValueError("Checkpoint does not contain a recognizable model state")
-    model = getattr(args, "model", None) if args is not None else None
+    def argument(name: str):
+        if isinstance(args, dict):
+            return args.get(name)
+        return getattr(args, name, None) if args is not None else None
+
+    declared_model = argument("model")
+    position = state_dict.get("net.pos_embed")
+    width = int(position.shape[-1]) if hasattr(position, "shape") else 0
+    state_model = (
+        "JiT-L/16"
+        if width == 1024
+        else "JiT-B/16"
+        if width == 768
+        else None
+    )
+    if (
+        declared_model in OFFICIAL_MODELS
+        and state_model is not None
+        and declared_model != state_model
+    ):
+        raise ValueError(
+            f"Checkpoint args declare {declared_model}, but state_dict matches {state_model}"
+        )
+    model = declared_model if declared_model in OFFICIAL_MODELS else state_model
     if model not in OFFICIAL_MODELS:
-        position = state_dict.get("net.pos_embed")
-        width = int(position.shape[-1]) if hasattr(position, "shape") else 0
-        model = "JiT-L/16" if width == 1024 else "JiT-B/16" if width == 768 else None
-    model = model or infer_checkpoint_model(path)
-    return {
-        "path": str(Path(path).resolve()),
-        "filename": Path(path).name,
-        "model": model or "unknown",
-        "img_size": getattr(args, "img_size", None),
-        "num_fonts": getattr(args, "num_fonts", None),
-        "num_chars": getattr(args, "num_chars", None),
-        "lora": any("lora_" in key for key in state_dict),
-        "state_keys": len(state_dict),
-        "trusted_required": True,
-    }
+        raise ValueError(
+            "Cannot determine checkpoint architecture from args or state_dict"
+        )
+    return create_checkpoint_metadata(
+        path,
+        architecture=model,
+        img_size=argument("img_size"),
+        num_fonts=argument("num_fonts"),
+        num_chars=argument("num_chars"),
+        lora=any(
+            ".base.weight" in key or "lora_" in key
+            for key in state_dict
+        ),
+        state_keys=len(state_dict),
+        source="trusted-import",
+        trusted_required=True,
+    )
+
+
+def queue_checkpoint_validation(
+    jobs: JobManager,
+    path: str | Path,
+    *,
+    project_id: str | None = None,
+    provenance_note: str = "",
+) -> str:
+    return jobs.submit(
+        "checkpoint_validation",
+        [
+            sys.executable,
+            str(ROOT / "scripts" / "validate_checkpoint.py"),
+            "--checkpoint",
+            str(Path(path).resolve()),
+            "--provenance-note",
+            provenance_note,
+        ],
+        project_id=project_id,
+        cwd=ROOT,
+    )
 
 
 def queue_official_model_download(

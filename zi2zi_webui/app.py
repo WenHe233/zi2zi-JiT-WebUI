@@ -9,6 +9,7 @@ from uuid import uuid4
 from urllib.parse import quote
 
 from .charts import latest_summary, run_parameter_rows, training_figures
+from .checkpoints import checkpoint_sidecar_path, read_checkpoint_sidecar
 from .devices import detect_devices, disk_free_gb
 from .font_builder import (
     FontMetadata,
@@ -49,6 +50,7 @@ from .services import (
     generation_checkpoint_options,
     import_model,
     infer_checkpoint_model,
+    queue_checkpoint_validation,
     queue_official_model_download,
     resolve_generation_checkpoint,
     resolve_training_dataset,
@@ -272,8 +274,39 @@ def build_app(
         project.base_model = model_path
         project.active_checkpoint = model_path
         storage.save_project(project)
-        variant = infer_checkpoint_model(model_path)
-        return f"Attached shared model: {model_path}\nArchitecture: {variant or 'unknown'}"
+        try:
+            metadata = read_checkpoint_sidecar(model_path)
+        except (FileNotFoundError, OSError, ValueError):
+            job_id = ensure_checkpoint_validation(model_path, project_id)
+            return (
+                f"Attached trusted shared model: {model_path}\n"
+                f"Metadata validation queued as job {job_id}. "
+                "Training remains disabled until the sidecar is ready."
+            )
+        return (
+            f"Attached shared model: {model_path}\n"
+            f"Architecture: {metadata['architecture']}\n"
+            f"SHA-256: {metadata['sha256']}"
+        )
+
+    def ensure_checkpoint_validation(model_path, project_id=None):
+        resolved = str(Path(model_path).resolve())
+        for job in jobs.list_jobs(project_id=project_id, limit=200):
+            if (
+                job["job_type"] == "checkpoint_validation"
+                and job["status"] in {"queued", "running"}
+                and resolved in json.loads(job["command_json"])
+            ):
+                return job["id"]
+        return queue_checkpoint_validation(
+            jobs,
+            resolved,
+            project_id=project_id,
+            provenance_note=(
+                "Shared model directory is trusted by local single-user policy. "
+                "Digest is recorded for audit/change detection, not provenance proof."
+            ),
+        )
 
     def queue_dataset(project_id, train_count, test_count, charset, workers):
         project = storage.get_project(project_id)
@@ -337,14 +370,18 @@ def build_app(
         project = storage.get_project(project_id)
         if not project.base_model:
             raise gr.Error("Import or download and attach a base model first")
-        metadata_path = Path(project.base_model).with_suffix(Path(project.base_model).suffix + ".json")
         overrides: dict[str, Any] = {"epochs": int(epochs)}
-        metadata: dict[str, Any] = {}
-        if metadata_path.exists():
-            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-            for key in ("num_fonts", "num_chars"):
-                if metadata.get(key):
-                    overrides[key] = metadata[key]
+        try:
+            metadata = read_checkpoint_sidecar(project.base_model)
+        except (FileNotFoundError, OSError, ValueError) as exc:
+            job_id = ensure_checkpoint_validation(project.base_model, project_id)
+            raise gr.Error(
+                f"Checkpoint metadata is missing or stale. Validation job {job_id} "
+                "is running; retry training after it succeeds."
+            ) from exc
+        for key in ("num_fonts", "num_chars"):
+            if metadata.get(key):
+                overrides[key] = metadata[key]
         model_variant = infer_checkpoint_model(project.base_model, metadata)
         if not model_variant:
             raise gr.Error(
@@ -461,6 +498,9 @@ def build_app(
             return gr.update(choices=[], value=None)
         project = storage.get_project(project_id)
         choices, preferred = generation_checkpoint_options(project, storage)
+        for _label, checkpoint in choices:
+            if not checkpoint_sidecar_path(checkpoint).is_file():
+                ensure_checkpoint_validation(checkpoint, project_id)
         return gr.update(choices=choices, value=preferred)
 
     def refresh_charts(project_id, run_ids):

@@ -1,6 +1,12 @@
 import pytest
+import torch
 from PIL import Image, ImageDraw
+from types import SimpleNamespace
 
+from zi2zi_webui.checkpoints import (
+    read_checkpoint_sidecar,
+    write_checkpoint_sidecar,
+)
 from zi2zi_webui.services import (
     font_dataset_capacity,
     dataset_max_chars_per_font,
@@ -11,6 +17,7 @@ from zi2zi_webui.services import (
     infer_checkpoint_model,
     resolve_generation_checkpoint,
     resolve_training_dataset,
+    validate_checkpoint,
 )
 from zi2zi_webui.font_builder import FontMetadata, build_ttf
 from zi2zi_webui.models import TrainingRun
@@ -150,9 +157,52 @@ def test_rendered_glyph_capacity_requires_valid_target_and_source_outlines(tmp_p
     assert font_dataset_capacity(project, "auto") == 1
 
 
-def test_checkpoint_variant_is_inferred_from_official_filename():
-    assert infer_checkpoint_model("zi2zi-JiT-L-16.pth") == "JiT-L/16"
-    assert infer_checkpoint_model("zi2zi-JiT-B-16.pth") == "JiT-B/16"
+def test_checkpoint_variant_is_not_inferred_from_filename():
+    assert infer_checkpoint_model("zi2zi-JiT-L-16.pth") is None
+    assert infer_checkpoint_model(
+        "misleading-name.pth",
+        {"architecture": "JiT-B/16"},
+    ) == "JiT-B/16"
+
+
+def test_checkpoint_validation_records_actual_architecture_size_and_sha256(
+    tmp_path,
+):
+    checkpoint = tmp_path / "misleading-JiT-L-16.pth"
+    torch.save(
+        {
+            "args": SimpleNamespace(
+                model="unknown",
+                img_size=256,
+                num_fonts=3,
+                num_chars=99,
+            ),
+            "model": {"net.pos_embed": torch.zeros(1, 4, 768)},
+        },
+        checkpoint,
+    )
+
+    metadata = validate_checkpoint(checkpoint)
+    assert metadata["architecture"] == "JiT-B/16"
+    assert metadata["num_fonts"] == 3
+    assert metadata["num_chars"] == 99
+    assert metadata["file_size"] == checkpoint.stat().st_size
+    assert len(metadata["sha256"]) == 64
+    write_checkpoint_sidecar(checkpoint, metadata)
+    assert read_checkpoint_sidecar(checkpoint)["architecture"] == "JiT-B/16"
+
+
+def test_checkpoint_validation_rejects_declared_architecture_mismatch(tmp_path):
+    checkpoint = tmp_path / "mismatch.pth"
+    torch.save(
+        {
+            "args": SimpleNamespace(model="JiT-L/16"),
+            "model": {"net.pos_embed": torch.zeros(1, 4, 768)},
+        },
+        checkpoint,
+    )
+    with pytest.raises(ValueError, match="state_dict matches JiT-B/16"):
+        validate_checkpoint(checkpoint)
 
 
 def test_training_dataset_falls_back_from_empty_or_invalid_path(tmp_path):

@@ -52,6 +52,9 @@ events.out.tfevents.*
 *.pth
 *.pt
 *.ckpt
+*.pth.json
+*.pt.json
+*.ckpt.json
 *.safetensors
 *.npy
 *.npz
