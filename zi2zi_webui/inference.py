@@ -12,6 +12,7 @@ from data_processing.font_utils import (
     GlyphRenderer,
     GlyphRendererPool,
     get_cjk_codepoints,
+    get_outline_codepoints,
     load_font,
 )
 
@@ -31,6 +32,23 @@ def select_reference(reference_paths: list[str], codepoint: int, seed: int) -> s
         raise ValueError("At least one style reference is required")
     digest = hashlib.sha256(f"{codepoint}:{seed}".encode("ascii")).digest()
     return reference_paths[int.from_bytes(digest[:8], "big") % len(reference_paths)]
+
+
+def exclude_existing_target_glyphs(
+    codepoints: Iterable[int],
+    target_font_path: str | Path | None,
+) -> tuple[list[int], list[int]]:
+    requested = sorted(set(int(value) for value in codepoints))
+    if not target_font_path:
+        return requested, []
+    target_font, _ = load_font(str(target_font_path))
+    try:
+        existing = get_outline_codepoints(target_font)
+    finally:
+        target_font.close()
+    skipped = [codepoint for codepoint in requested if codepoint in existing]
+    generated = [codepoint for codepoint in requested if codepoint not in existing]
+    return generated, skipped
 
 
 def build_inference_npz(

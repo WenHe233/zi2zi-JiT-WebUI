@@ -93,6 +93,12 @@ def get_cjk_codepoints(font: TTFont, filter_empty: bool = True) -> Set[int]:
     return cjk_codepoints
 
 
+def get_outline_codepoints(font: TTFont) -> Set[int]:
+    """Return every encoded Unicode codepoint backed by a non-empty outline."""
+    cmap = font.getBestCmap() or {}
+    return {codepoint for codepoint in cmap if has_valid_outline(font, codepoint)}
+
+
 def extract_font_name(font: TTFont, fallback_path: Path) -> str:
     name_table = font.get("name")
     if not name_table:

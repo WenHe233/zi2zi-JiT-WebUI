@@ -11,7 +11,10 @@ from zi2zi_webui.font_builder import (
     build_ttf,
     codepoint_from_filename,
 )
-from zi2zi_webui.inference import render_style_references
+from zi2zi_webui.inference import (
+    exclude_existing_target_glyphs,
+    render_style_references,
+)
 
 
 def _glyph(path: Path):
@@ -51,6 +54,90 @@ def test_build_ttf_with_hole(tmp_path):
         assert {"font/Demo.ttf", "README.txt", "glyph-manifest.json"}.issubset(
             archive.namelist()
         )
+
+
+def test_target_font_existing_glyphs_are_skipped_and_missing_glyphs_are_merged(tmp_path):
+    source = tmp_path / "shape.png"
+    _glyph(source)
+    base_path = tmp_path / "Base.ttf"
+    build_ttf(
+        {0x4E00: source},
+        base_path,
+        FontMetadata(
+            family_name="Base",
+            license_description="Original target license",
+        ),
+    )
+    base_font = TTFont(base_path)
+    base_order = base_font.getGlyphOrder()
+    base_tables = set(base_font.keys())
+    original_name = base_font.getBestCmap()[0x4E00]
+    original_glyph = base_font["glyf"][original_name].compile(base_font["glyf"])
+    original_upm = base_font["head"].unitsPerEm
+    base_font.close()
+
+    generated, skipped = exclude_existing_target_glyphs(
+        [0x4E00, 0x4E01],
+        base_path,
+    )
+    assert generated == [0x4E01]
+    assert skipped == [0x4E00]
+
+    output = tmp_path / "Extended.ttf"
+    report = build_ttf(
+        {0x4E00: source, 0x4E01: source},
+        output,
+        FontMetadata(
+            family_name="Extended",
+            license_description="Additional generated-glyph notice",
+        ),
+        base_font_path=base_path,
+    )
+
+    assert report["base_glyph_count"] == len(base_order)
+    assert report["added_glyph_count"] == 1
+    assert report["skipped_existing_count"] == 1
+    merged = TTFont(output)
+    merged_cmap = merged.getBestCmap()
+    assert merged_cmap[0x4E00] == original_name
+    assert 0x4E01 in merged_cmap
+    assert merged["glyf"][original_name].compile(merged["glyf"]) == original_glyph
+    assert merged["head"].unitsPerEm == original_upm
+    assert merged["OS/2"].usLastCharIndex == 0x4E01
+    assert set(base_tables) <= set(merged.keys())
+    assert len(merged.getGlyphOrder()) == len(base_order) + 1
+    merged_license = "\n".join(
+        record.toUnicode()
+        for record in merged["name"].names
+        if record.nameID == 13
+    )
+    assert "Original target license" in merged_license
+    assert "Additional generated-glyph notice" in merged_license
+    merged.close()
+
+
+def test_incremental_packaging_can_export_an_unchanged_base_font(tmp_path):
+    source = tmp_path / "shape.png"
+    _glyph(source)
+    base_path = tmp_path / "Base.ttf"
+    build_ttf(
+        {0x4E00: source},
+        base_path,
+        FontMetadata(family_name="Base"),
+    )
+
+    output = tmp_path / "Renamed.ttf"
+    report = build_ttf(
+        {},
+        output,
+        FontMetadata(family_name="Renamed"),
+        base_font_path=base_path,
+    )
+
+    assert report["added_glyph_count"] == 0
+    unchanged = TTFont(output)
+    assert unchanged.getBestCmap()[0x4E00]
+    unchanged.close()
 
 
 def test_target_font_creates_eight_style_references(tmp_path):

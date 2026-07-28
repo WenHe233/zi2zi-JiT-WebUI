@@ -142,12 +142,18 @@ from sources you trust.
 
 #### TTF export
 
-Generated PNGs can be traced to editable SVGs and packaged as an unhinted
-TrueType draft. The exporter offers proportional Latin metrics or a 2:1
-CJK/Latin monospace profile, reports failed glyphs, and never copies source
-font outlines as a fallback. It also creates a ZIP containing the TTF,
-selected PNGs, editable SVGs, glyph/seed manifests, training and font-quality
-reports, and a README. Review these artifacts before publishing a font.
+Generation automatically removes codepoints already backed by valid outlines
+in the target font and records the decision in `generation-plan.json`. Export
+starts from that target TTF, retains its original glyphs, metrics and OpenType
+tables, and appends only generated missing glyphs. CFF-outline OTF and variable
+fonts cannot currently be incremental bases. Source-font outlines are never
+copied as fallback content.
+
+Generated PNGs remain traceable to editable SVGs. The exporter offers
+proportional Latin metrics or a 2:1 CJK/Latin profile for added glyphs and
+creates a ZIP containing the merged TTF, selected PNGs, SVGs, manifests,
+training and font-quality reports, and a README. Confirm that the target
+font's license permits modification and redistribution before publishing.
 
 See [character preset design](docs/charset-presets.md) for preset provenance
 and regional-font behavior.

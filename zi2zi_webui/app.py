@@ -15,6 +15,7 @@ from .i18n import translator
 from .inference import (
     build_inference_npz,
     choose_diverse_references,
+    exclude_existing_target_glyphs,
     render_style_references,
 )
 from .jobs import JobManager
@@ -533,15 +534,21 @@ def build_app(
         allow_large_candidates,
     ):
         project = storage.get_project(project_id)
-        codepoints, increments = resolve_selection(
+        requested_codepoints, increments = resolve_selection(
             preset_ids or [],
             custom_text=text or "",
             custom_file=custom_file,
         )
+        target_font_path = (
+            project.target_assets[0]
+            if project.input_mode == "font" and project.target_assets
+            else None
+        )
+        codepoints, skipped_existing = exclude_existing_target_glyphs(
+            requested_codepoints, target_font_path
+        )
         if int(candidates) > 1 and len(codepoints) > 64 and not allow_large_candidates:
             raise gr.Error("Candidate generation is limited to 64 glyphs unless explicitly unlocked")
-        if not project.style_reference_pool:
-            raise gr.Error("The project needs at least one style reference")
         project.charset_presets = list(preset_ids or [])
         project.split_regions = bool(split_regions)
         project.primary_region = primary_region
@@ -550,7 +557,34 @@ def build_app(
         request_dir = storage.project_dir(project_id) / "generation" / f"request-{request_id}"
         request_dir.mkdir(parents=True, exist_ok=True)
         write_selection_manifest(
-            request_dir / "charset.json", list(preset_ids or []), codepoints, increments
+            request_dir / "charset.json",
+            list(preset_ids or []),
+            requested_codepoints,
+            increments,
+        )
+        (request_dir / "generation-plan.json").write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "target_font": (
+                        project.target_assets[0]
+                        if project.input_mode == "font" and project.target_assets
+                        else ""
+                    ),
+                    "requested_count": len(requested_codepoints),
+                    "skipped_existing_count": len(skipped_existing),
+                    "generation_count": len(codepoints),
+                    "skipped_existing": [
+                        f"U+{value:04X}" for value in skipped_existing
+                    ],
+                    "generation_codepoints": [
+                        f"U+{value:04X}" for value in codepoints
+                    ],
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
         )
         if split_regions:
             regional = resolve_selection_by_region(
@@ -559,8 +593,33 @@ def build_app(
                 custom_text=text or "",
                 custom_file=custom_file,
             )
+            skipped_set = set(skipped_existing)
+            regional = {
+                region: [
+                    codepoint
+                    for codepoint in region_codepoints
+                    if codepoint not in skipped_set
+                ]
+                for region, region_codepoints in regional.items()
+            }
+            regional = {
+                region: region_codepoints
+                for region, region_codepoints in regional.items()
+                if region_codepoints
+            }
         else:
             regional = {primary_region: codepoints}
+        if not regional:
+            return (
+                "",
+                b(
+                    f"无需生成：请求的 {len(requested_codepoints)} 个字符均已存在于目标字体中。",
+                    f"No generation required: all {len(requested_codepoints)} requested "
+                    "characters already exist in the target font.",
+                ),
+            )
+        if not project.style_reference_pool:
+            raise gr.Error("The project needs at least one style reference")
         job_ids = []
         outputs = []
         fallbacks = []
@@ -605,8 +664,11 @@ def build_app(
         )
         return (
             "\n".join(str(item) for item in outputs),
-            f"Queued {len(codepoints)} unique glyphs in {len(job_ids)} regional job(s): "
-            f"{', '.join(job_ids)}.{warning}",
+            (
+                f"Queued {len(codepoints)} missing glyphs in {len(job_ids)} regional job(s): "
+                f"{', '.join(job_ids)}. Skipped {len(skipped_existing)} glyphs already "
+                f"present in the target font.{warning}"
+            ),
         )
 
     def find_generated(project_id):
@@ -654,8 +716,29 @@ def build_app(
         threshold,
         despeckle,
     ):
+        project = storage.get_project(project_id)
         project_dir = storage.project_dir(project_id)
         selection = project_dir / "glyphs" / "selection.json"
+        base_font_path = ""
+        if project.input_mode == "font":
+            if not project.target_assets:
+                raise gr.Error("The project does not have a target font")
+            base_font_path = project.target_assets[0]
+            from fontTools.ttLib import TTFont
+
+            base_font = TTFont(base_font_path)
+            try:
+                if "glyf" not in base_font or "hmtx" not in base_font:
+                    raise gr.Error(
+                        "Incremental packaging requires a TrueType-outline target; "
+                        "CFF-outline OTF fonts are not supported"
+                    )
+                if "fvar" in base_font or "gvar" in base_font:
+                    raise gr.Error(
+                        "Incremental packaging does not support variable-font targets"
+                    )
+            finally:
+                base_font.close()
         job_ids = []
         for profile in profiles or ["proportional"]:
             suffix = "Text" if profile == "proportional" else "Mono"
@@ -686,6 +769,8 @@ def build_app(
                 "--project-dir",
                 str(project_dir),
             ]
+            if base_font_path:
+                command += ["--base-font", base_font_path]
             if selection.exists():
                 command += ["--selection-manifest", str(selection)]
             job_ids.append(
@@ -1116,6 +1201,15 @@ def build_app(
             )
 
         with gr.Tab(t("generation")):
+            gr.Markdown(
+                b(
+                    "目标字体中已有有效轮廓的字符会自动跳过，只生成缺失字形；"
+                    "请求、跳过和生成清单会写入 generation-plan.json。",
+                    "Characters already backed by valid outlines in the target font are "
+                    "skipped automatically; only missing glyphs are generated. The request, "
+                    "skipped, and generation lists are recorded in generation-plan.json.",
+                )
+            )
             generation_text = gr.Textbox(
                 label=b("自定义文字", "Custom text"), lines=4,
                 placeholder=b("输入需要生成的字符…", "Enter characters to generate…"),
@@ -1160,6 +1254,16 @@ def build_app(
             candidate_status = gr.Markdown()
 
         with gr.Tab(t("export")):
+            gr.Markdown(
+                b(
+                    "字体导出以目标 TTF 为底稿，保留原字形、字宽和 OpenType 表，仅追加"
+                    "生成的缺失字形。当前不支持将 CFF 轮廓 OTF 或可变字体作为增量封装底稿。",
+                    "Export starts from the target TTF, retaining its original glyphs, metrics, "
+                    "and OpenType tables while adding only generated missing glyphs. "
+                    "CFF-outline OTF and variable-font bases are not supported for "
+                    "incremental packaging.",
+                )
+            )
             glyph_dir = gr.Textbox(label=b("生成字形目录", "Generated glyph directory"))
             with gr.Row():
                 family_name = gr.Textbox(label=b("字体家族名", "Family name"))

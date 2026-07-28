@@ -29,6 +29,11 @@ def main() -> None:
     parser.add_argument("--despeckle-area", type=int, default=4)
     parser.add_argument("--selection-manifest", default="")
     parser.add_argument("--project-dir", default="")
+    parser.add_argument(
+        "--base-font",
+        default="",
+        help="Static TrueType target font whose existing glyphs and tables are retained.",
+    )
     args = parser.parse_args()
 
     glyphs = scan_glyph_directory(args.glyph_dir)
@@ -36,7 +41,7 @@ def main() -> None:
         selections = json.loads(Path(args.selection_manifest).read_text(encoding="utf-8"))
         for label, path in selections.items():
             glyphs[int(label.removeprefix("U+"), 16)] = Path(path)
-    if not glyphs:
+    if not glyphs and not args.base_font:
         raise SystemExit("No U+XXXX-named glyph images were found.")
     report = build_ttf(
         glyphs,
@@ -65,6 +70,7 @@ def main() -> None:
             ),
             flush=True,
         ),
+        base_font_path=args.base_font or None,
     )
     archive = build_export_package(
         args.output,

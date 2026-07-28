@@ -18,6 +18,10 @@ from fontTools.pens.cu2quPen import Cu2QuPen
 from fontTools.pens.transformPen import TransformPen
 from fontTools.pens.ttGlyphPen import TTGlyphPen
 from fontTools.svgLib.path import parse_path
+from fontTools.ttLib import TTFont
+from fontTools.ttLib.tables._c_m_a_p import CmapSubtable
+
+from data_processing.font_utils import get_outline_codepoints
 
 
 ATTRIBUTION = "Created using zi2zi-JiT artifacts"
@@ -143,6 +147,99 @@ def _glyph_from_svg(svg_path: Path, transform: tuple[float, float, float, float,
     return pen.glyph()
 
 
+def _glyph_name(codepoint: int, used_names: set[str]) -> str:
+    base = f"uni{codepoint:04X}" if codepoint <= 0xFFFF else f"u{codepoint:06X}"
+    if base not in used_names:
+        return base
+    suffix = 1
+    while f"{base}.zi2zi{suffix}" in used_names:
+        suffix += 1
+    return f"{base}.zi2zi{suffix}"
+
+
+def _update_cmap(font: TTFont, additions: dict[int, str]) -> None:
+    if not additions:
+        return
+    unicode_tables = [
+        table
+        for table in font["cmap"].tables
+        if table.isUnicode() and hasattr(table, "cmap")
+    ]
+    if any(codepoint > 0xFFFF for codepoint in additions) and not any(
+        table.format in {12, 13} for table in unicode_tables
+    ):
+        table = CmapSubtable.newSubtable(12)
+        table.platformID = 3
+        table.platEncID = 10
+        table.language = 0
+        table.cmap = dict(font.getBestCmap() or {})
+        font["cmap"].tables.append(table)
+        unicode_tables.append(table)
+    for table in unicode_tables:
+        for codepoint, glyph_name in additions.items():
+            if codepoint <= 0xFFFF or table.format in {12, 13}:
+                table.cmap[codepoint] = glyph_name
+
+
+def _set_name(font: TTFont, name_id: int, value: str) -> None:
+    if not value:
+        return
+    updated = False
+    for record in font["name"].names:
+        if record.nameID != name_id:
+            continue
+        try:
+            record.string = value.encode(record.getEncoding())
+            updated = True
+        except (LookupError, UnicodeEncodeError):
+            continue
+    if not updated:
+        font["name"].setName(value, name_id, 3, 1, 0x409)
+
+
+def _update_base_font_names(
+    font: TTFont,
+    metadata: FontMetadata,
+    *,
+    attributed: bool,
+) -> None:
+    family = metadata.family_name.strip()
+    style = metadata.style_name.strip() or "Regular"
+    ps_name = re.sub(r"[^A-Za-z0-9-]", "", f"{family}-{style}")[:63] or "Zi2ZiFont"
+    values = {
+        1: family,
+        2: style,
+        3: f"{family}-{style}-{metadata.version}",
+        4: f"{family} {style}".strip(),
+        5: f"Version {metadata.version}",
+        6: ps_name,
+    }
+    if metadata.copyright:
+        values[0] = metadata.copyright
+    if metadata.designer:
+        values[9] = metadata.designer
+    for name_id, value in values.items():
+        _set_name(font, name_id, value)
+    if metadata.license_description:
+        existing_licenses = [
+            record.toUnicode()
+            for record in font["name"].names
+            if record.nameID == 13
+        ]
+        combined_license = "\n".join(
+            dict.fromkeys([*existing_licenses, metadata.license_description])
+        )
+        _set_name(font, 13, combined_license)
+    if attributed:
+        descriptions = [
+            record.toUnicode()
+            for record in font["name"].names
+            if record.nameID == 10
+        ]
+        description = "\n".join(dict.fromkeys([*descriptions, ATTRIBUTION, UPSTREAM_URL]))
+        _set_name(font, 10, description)
+
+
 def build_ttf(
     glyph_images: dict[int, str | Path],
     output_path: str | Path,
@@ -152,28 +249,78 @@ def build_ttf(
     vectorize_options: VectorizeOptions | None = None,
     svg_dir: str | Path | None = None,
     progress_callback: Callable[[int, int, int], None] | None = None,
+    base_font_path: str | Path | None = None,
 ) -> dict:
     if not metadata.family_name.strip():
         raise ValueError("Font family name is required")
-    if len(glyph_images) + 1 > 65535:
-        raise ValueError("The font would exceed the TrueType 65,535 glyph limit")
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     svg_dir = Path(svg_dir or output_path.with_suffix("")) / "svg"
     svg_dir.mkdir(parents=True, exist_ok=True)
 
-    glyphs = {}
-    metrics = {}
-    character_map = {}
-    glyph_order = [".notdef"]
-    empty_pen = TTGlyphPen(None)
-    glyphs[".notdef"] = empty_pen.glyph()
-    metrics[".notdef"] = (1000, 50)
-    report = {"included": [], "failed": [], "metrics_profile": metrics_profile}
+    base_font = None
+    existing_outlines: set[int] = set()
+    if base_font_path:
+        candidate_font = TTFont(str(base_font_path))
+        try:
+            if "glyf" not in candidate_font or "hmtx" not in candidate_font:
+                raise ValueError(
+                    "Incremental packaging requires a static TrueType font with glyf/hmtx "
+                    "tables; CFF-outline OTF fonts are not supported"
+                )
+            if "fvar" in candidate_font or "gvar" in candidate_font:
+                raise ValueError(
+                    "Incremental packaging does not support variable-font targets"
+                )
+            existing_outlines = get_outline_codepoints(candidate_font)
+            glyphs = candidate_font["glyf"].glyphs
+            metrics = candidate_font["hmtx"].metrics
+            character_map = dict(candidate_font.getBestCmap() or {})
+            glyph_order = list(candidate_font.getGlyphOrder())
+            upm = int(candidate_font["head"].unitsPerEm)
+        except Exception:
+            candidate_font.close()
+            raise
+        base_font = candidate_font
+    else:
+        glyphs = {}
+        metrics = {}
+        character_map = {}
+        glyph_order = [".notdef"]
+        empty_pen = TTGlyphPen(None)
+        glyphs[".notdef"] = empty_pen.glyph()
+        metrics[".notdef"] = (1000, 50)
+        upm = 1000
 
-    ordered_images = sorted(glyph_images.items())
+    skipped_existing = sorted(set(glyph_images) & existing_outlines)
+    ordered_images = [
+        (codepoint, image_path)
+        for codepoint, image_path in sorted(glyph_images.items())
+        if codepoint not in existing_outlines
+    ]
+    if len(glyph_order) + len(ordered_images) > 65535:
+        if base_font is not None:
+            base_font.close()
+        raise ValueError("The font would exceed the TrueType 65,535 glyph limit")
+    report = {
+        "included": [],
+        "failed": [],
+        "skipped_existing": [
+            {
+                "codepoint": f"U+{codepoint:04X}",
+                "glyph": character_map.get(codepoint, ""),
+            }
+            for codepoint in skipped_existing
+        ],
+        "metrics_profile": metrics_profile,
+        "base_font": str(Path(base_font_path).resolve()) if base_font_path else "",
+        "base_glyph_count": len(glyph_order) if base_font is not None else 0,
+    }
+
+    used_names = set(glyph_order)
+    additions: dict[int, str] = {}
     for index, (codepoint, image_path) in enumerate(ordered_images, start=1):
-        glyph_name = f"uni{codepoint:04X}" if codepoint <= 0xFFFF else f"u{codepoint:06X}"
+        glyph_name = _glyph_name(codepoint, used_names)
         svg_path = svg_dir / f"U+{codepoint:04X}.svg"
         try:
             options = vectorize_options or VectorizeOptions()
@@ -195,25 +342,42 @@ def build_ttf(
                     encoding="utf-8",
                 )
             bbox = qa.get("bbox") or [0, 0, 255, 255]
-            base_scale = 900 / 256
+            base_scale = (upm * 0.9) / 256
+            margin = upm * 0.05
             if codepoint < 0x0250 and metrics_profile == "monospace-2to1":
-                x_scale = min((500 - 80) / max(1, bbox[2] - bbox[0] + 1), base_scale)
-                advance = 500
-                x_offset = 40 - bbox[0] * x_scale
+                advance = max(1, int(round(upm / 2)))
+                side_margin = upm * 0.04
+                x_scale = min(
+                    (advance - 2 * side_margin)
+                    / max(1, bbox[2] - bbox[0] + 1),
+                    base_scale,
+                )
+                x_offset = side_margin - bbox[0] * x_scale
             elif codepoint < 0x0250:
                 x_scale = base_scale
                 ink_width = (bbox[2] - bbox[0] + 1) * x_scale
-                advance = int(max(300, min(900, ink_width + 120)))
-                x_offset = 60 - bbox[0] * x_scale
+                advance = int(
+                    max(upm * 0.3, min(upm * 0.9, ink_width + upm * 0.12))
+                )
+                x_offset = upm * 0.06 - bbox[0] * x_scale
             else:
                 x_scale = base_scale
-                advance = 1000
-                x_offset = 50
-            transform = (x_scale, 0, 0, -base_scale, x_offset, 850)
+                advance = upm
+                x_offset = margin
+            transform = (
+                x_scale,
+                0,
+                0,
+                -base_scale,
+                x_offset,
+                upm * 0.85,
+            )
             glyphs[glyph_name] = _glyph_from_svg(svg_path, transform)
             metrics[glyph_name] = (advance, max(0, int(x_offset)))
             character_map[codepoint] = glyph_name
             glyph_order.append(glyph_name)
+            used_names.add(glyph_name)
+            additions[codepoint] = glyph_name
             report["included"].append(
                 {"codepoint": f"U+{codepoint:04X}", "glyph": glyph_name, "qa": qa}
             )
@@ -224,51 +388,68 @@ def build_ttf(
         if progress_callback is not None:
             progress_callback(index, len(ordered_images), codepoint)
 
-    font = FontBuilder(1000, isTTF=True)
-    font.setupGlyphOrder(glyph_order)
-    font.setupCharacterMap(character_map)
-    font.setupGlyf(glyphs)
-    font.setupHorizontalMetrics(metrics)
-    font.setupHorizontalHeader(ascent=880, descent=-120)
-    font.setupOS2(
-        sTypoAscender=880,
-        sTypoDescender=-120,
-        sTypoLineGap=0,
-        usWinAscent=880,
-        usWinDescent=120,
-        sxHeight=500,
-        sCapHeight=700,
-    )
     attributed = len(report["included"]) > 200
-    description = metadata.license_description
-    if attributed:
-        description = f"{description}\n{ATTRIBUTION}\n{UPSTREAM_URL}".strip()
-    family = metadata.family_name.strip()
-    style = metadata.style_name.strip() or "Regular"
-    font.setupNameTable(
-        {
-            "familyName": family,
-            "styleName": style,
-            "uniqueFontIdentifier": f"{family}-{style}-{metadata.version}",
-            "fullName": f"{family} {style}".strip(),
-            "psName": re.sub(r"[^A-Za-z0-9-]", "", f"{family}-{style}")[:63] or "Zi2ZiFont",
-            "version": f"Version {metadata.version}",
-            "copyright": metadata.copyright,
-            "designer": metadata.designer,
-            "description": ATTRIBUTION if attributed else "Generated with zi2zi-JiT",
-            "licenseDescription": description,
-            "licenseInfoURL": UPSTREAM_URL if attributed else "",
-        }
-    )
-    font.setupPost()
-    font.setupMaxp()
-    font.setupHead()
-    font.save(output_path)
+    if base_font is not None:
+        base_font.setGlyphOrder(glyph_order)
+        _update_cmap(base_font, additions)
+        base_font["maxp"].numGlyphs = len(glyph_order)
+        if "OS/2" in base_font:
+            base_font["OS/2"].updateFirstAndLastCharIndex(base_font)
+            base_font["OS/2"].recalcUnicodeRanges(base_font)
+        if "DSIG" in base_font:
+            del base_font["DSIG"]
+        _update_base_font_names(base_font, metadata, attributed=attributed)
+        try:
+            base_font.save(output_path)
+        finally:
+            base_font.close()
+    else:
+        font = FontBuilder(1000, isTTF=True)
+        font.setupGlyphOrder(glyph_order)
+        font.setupCharacterMap(character_map)
+        font.setupGlyf(glyphs)
+        font.setupHorizontalMetrics(metrics)
+        font.setupHorizontalHeader(ascent=880, descent=-120)
+        font.setupOS2(
+            sTypoAscender=880,
+            sTypoDescender=-120,
+            sTypoLineGap=0,
+            usWinAscent=880,
+            usWinDescent=120,
+            sxHeight=500,
+            sCapHeight=700,
+        )
+        description = metadata.license_description
+        if attributed:
+            description = f"{description}\n{ATTRIBUTION}\n{UPSTREAM_URL}".strip()
+        family = metadata.family_name.strip()
+        style = metadata.style_name.strip() or "Regular"
+        font.setupNameTable(
+            {
+                "familyName": family,
+                "styleName": style,
+                "uniqueFontIdentifier": f"{family}-{style}-{metadata.version}",
+                "fullName": f"{family} {style}".strip(),
+                "psName": re.sub(r"[^A-Za-z0-9-]", "", f"{family}-{style}")[:63] or "Zi2ZiFont",
+                "version": f"Version {metadata.version}",
+                "copyright": metadata.copyright,
+                "designer": metadata.designer,
+                "description": ATTRIBUTION if attributed else "Generated with zi2zi-JiT",
+                "licenseDescription": description,
+                "licenseInfoURL": UPSTREAM_URL if attributed else "",
+            }
+        )
+        font.setupPost()
+        font.setupMaxp()
+        font.setupHead()
+        font.save(output_path)
 
     report.update(
         {
             "font_path": str(output_path),
             "glyph_count": len(glyph_order),
+            "added_glyph_count": len(report["included"]),
+            "skipped_existing_count": len(report["skipped_existing"]),
             "attribution_required": attributed,
             "attribution": ATTRIBUTION if attributed else "",
         }
@@ -289,13 +470,23 @@ def _write_html_report(report: dict, output: Path) -> None:
         f"<li>{html.escape(item['codepoint'])}: {html.escape(item['error'])}</li>"
         for item in report["failed"]
     )
+    skipped = "".join(
+        f"<li>{html.escape(item['codepoint'])}: retained "
+        f"{html.escape(item.get('glyph', ''))}</li>"
+        for item in report.get("skipped_existing", [])
+    )
+    base = html.escape(report.get("base_font", "")) or "None"
     output.write_text(
         "<!doctype html><meta charset='utf-8'><title>Font build report</title>"
         "<style>body{font-family:system-ui;max-width:1000px;margin:2rem auto}"
         "table{border-collapse:collapse;width:100%}td,th{border:1px solid #ddd;padding:.4rem}</style>"
         f"<h1>Font build report</h1><p>Glyphs: {report['glyph_count']}</p>"
+        f"<p>Base font: {base}</p>"
+        f"<p>Retained base glyphs: {report.get('base_glyph_count', 0)}; "
+        f"added glyphs: {report.get('added_glyph_count', len(report['included']))}</p>"
         f"<p>Profile: {html.escape(report['metrics_profile'])}</p>"
         f"<h2>Failures</h2><ul>{failures or '<li>None</li>'}</ul>"
+        f"<h2>Existing glyphs retained</h2><ul>{skipped or '<li>None</li>'}</ul>"
         f"<h2>Glyphs</h2><table><tr><th>Codepoint</th><th>Name</th><th>Contours</th>"
         f"<th>Ink ratio</th></tr>{rows}</table>",
         encoding="utf-8",
@@ -326,9 +517,17 @@ def build_export_package(
     archive_path = font_path.with_suffix(".zip")
     svg_dir = font_path.with_suffix("") / "svg"
     included = {item["codepoint"] for item in report.get("included", [])}
+    base_note = (
+        "The installable font retains the target TrueType font's original glyphs "
+        "and OpenType tables, and adds only generated glyphs that were missing. "
+        f"Base font: {report['base_font']}\n\n"
+        if report.get("base_font")
+        else ""
+    )
     readme = (
         "zi2zi-JiT generated font draft\n\n"
-        "This package contains an unhinted TrueType draft, editable SVG outlines, "
+        f"{base_note}"
+        "This package contains a TrueType draft, editable SVG outlines, "
         "the selected generated PNG glyphs, build quality reports, and available "
         "generation/training manifests. Failed glyphs are listed in the report and "
         "were not replaced with source-font outlines.\n\n"
@@ -340,6 +539,10 @@ def build_export_package(
         "schema_version": 1,
         "font": font_path.name,
         "glyph_count": report.get("glyph_count"),
+        "base_font": report.get("base_font", ""),
+        "base_glyph_count": report.get("base_glyph_count", 0),
+        "added_glyph_count": report.get("added_glyph_count", 0),
+        "skipped_existing": report.get("skipped_existing", []),
         "attribution_required": report.get("attribution_required", False),
         "glyphs": [
             {
