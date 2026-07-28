@@ -1,9 +1,14 @@
 from pathlib import Path
 from statistics import median
+import subprocess
+import sys
 
-from PIL import Image, ImageDraw
+import numpy as np
+from PIL import Image, ImageDraw, ImageFont
 from fontTools.pens.ttGlyphPen import TTGlyphPen
+from fontTools.fontBuilder import FontBuilder
 from fontTools.ttLib import TTFont
+from fontTools.ttLib.tables.DefaultTable import DefaultTable
 
 import pytest
 
@@ -35,6 +40,21 @@ def _glyph(path: Path, outer=(45, 35, 210, 220), inner=(90, 80, 165, 175)):
     draw.rectangle(outer, fill="black")
     draw.rectangle(inner, fill="white")
     image.convert("RGB").save(path)
+
+
+def _assert_rendered_hole(font_path: Path, codepoint: int = 0x4E00) -> None:
+    rendered = Image.new("L", (256, 256), "white")
+    draw = ImageDraw.Draw(rendered)
+    draw.text(
+        (20, 10),
+        chr(codepoint),
+        font=ImageFont.truetype(str(font_path), 190),
+        fill="black",
+    )
+    ink = np.asarray(rendered) < 128
+    ys, xs = ink.nonzero()
+    center = (int((xs.min() + xs.max()) / 2), int((ys.min() + ys.max()) / 2))
+    assert rendered.getpixel(center) > 220
 
 
 def test_filename_codepoint_parser():
@@ -198,6 +218,8 @@ def test_build_ttf_with_hole(tmp_path):
     font = TTFont(output)
     assert font.getBestCmap()[0x4E00] == "uni4E00"
     assert font["head"].unitsPerEm == 1000
+    font.close()
+    _assert_rendered_hole(output)
     stale_svg = output.with_suffix("") / "svg" / "U+4E01.svg"
     stale_svg.write_text("<svg/>", encoding="utf-8")
     package = build_export_package(output, {0x4E00: source})
@@ -210,6 +232,24 @@ def test_build_ttf_with_hole(tmp_path):
         )
         assert "svg/U+4E00.svg" in archive.namelist()
         assert "svg/U+4E01.svg" not in archive.namelist()
+
+
+def test_opencv_fallback_preserves_hole_in_rendered_font(tmp_path, monkeypatch):
+    import vtracer
+
+    def fail(*_args, **_kwargs):
+        raise RuntimeError("force OpenCV fallback")
+
+    monkeypatch.setattr(vtracer, "convert_image_to_svg_py", fail)
+    source = tmp_path / "hole.png"
+    _glyph(source)
+    output = tmp_path / "FallbackHole.ttf"
+    build_ttf(
+        {0x4E00: source},
+        output,
+        FontMetadata(family_name="Fallback hole"),
+    )
+    _assert_rendered_hole(output)
 
 
 def test_target_font_existing_glyphs_are_skipped_and_missing_glyphs_are_merged(tmp_path):
@@ -323,7 +363,7 @@ def test_generated_cjk_layout_matches_base_font_size_center_and_advance(tmp_path
     font.close()
 
 
-def test_incremental_packaging_can_export_an_unchanged_base_font(tmp_path):
+def test_incremental_packaging_rejects_an_unchanged_base_font(tmp_path):
     source = tmp_path / "shape.png"
     _glyph(source)
     base_path = tmp_path / "Base.ttf"
@@ -334,17 +374,100 @@ def test_incremental_packaging_can_export_an_unchanged_base_font(tmp_path):
     )
 
     output = tmp_path / "Renamed.ttf"
+    with pytest.raises(ValueError, match="unchanged renamed font"):
+        build_ttf(
+            {},
+            output,
+            FontMetadata(family_name="Renamed"),
+            base_font_path=base_path,
+        )
+    assert not output.exists()
+
+
+def test_incremental_packaging_extends_vertical_metrics_and_drops_stale_tables(
+    tmp_path,
+):
+    source = tmp_path / "shape.png"
+    _glyph(source)
+    base_path = tmp_path / "VerticalBase.ttf"
+    build_ttf(
+        {0x4E00 + index: source for index in range(8)},
+        base_path,
+        FontMetadata(family_name="Vertical base"),
+    )
+    font = TTFont(base_path)
+    builder = FontBuilder(font=font)
+    builder.setupVerticalMetrics(
+        {glyph_name: (1000, 120) for glyph_name in font.getGlyphOrder()}
+    )
+    builder.setupVerticalHeader(ascent=880, descent=-120)
+    for tag in ("hdmx", "LTSH", "VDMX", "VORG"):
+        table = DefaultTable(tag)
+        table.data = b"obsolete"
+        font[tag] = table
+    font.save(base_path)
+    font.close()
+
+    output = tmp_path / "VerticalExtended.ttf"
     report = build_ttf(
-        {},
+        {0x4E10: source},
         output,
-        FontMetadata(family_name="Renamed"),
+        FontMetadata(family_name="Vertical extended"),
         base_font_path=base_path,
     )
 
-    assert report["added_glyph_count"] == 0
-    unchanged = TTFont(output)
-    assert unchanged.getBestCmap()[0x4E00]
-    unchanged.close()
+    assert report["added_glyph_count"] == 1
+    merged = TTFont(output, checkChecksums=2)
+    order = merged.getGlyphOrder()
+    name = merged.getBestCmap()[0x4E10]
+    assert len(merged["vmtx"].metrics) == len(order)
+    assert 1 <= merged["vhea"].numberOfVMetrics <= len(order)
+    assert merged["vmtx"][name][0] == 1000
+    assert all(tag not in merged for tag in ("hdmx", "LTSH", "VDMX", "VORG"))
+    merged.close()
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        FontMetadata(family_name=""),
+        FontMetadata(family_name="../escape"),
+        FontMetadata(family_name="Safe", style_name="bad/name"),
+        FontMetadata(family_name="Safe", version="1.0\nInjected"),
+    ],
+)
+def test_font_metadata_rejects_empty_or_path_like_values(tmp_path, metadata):
+    source = tmp_path / "shape.png"
+    _glyph(source)
+    with pytest.raises(ValueError):
+        build_ttf({0x4E00: source}, tmp_path / "unsafe.ttf", metadata)
+
+
+def test_font_build_script_rejects_output_outside_project_fonts(tmp_path):
+    glyph_dir = tmp_path / "glyphs"
+    glyph_dir.mkdir()
+    project_dir = tmp_path / "project"
+    script = Path(__file__).parents[1] / "scripts" / "build_font.py"
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(script),
+            "--glyph-dir",
+            str(glyph_dir),
+            "--output",
+            str(tmp_path / "escaped.ttf"),
+            "--family",
+            "Safe",
+            "--project-dir",
+            str(project_dir),
+        ],
+        cwd=script.parents[1],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode != 0
+    assert "project fonts directory" in result.stderr
 
 
 def test_target_font_creates_eight_style_references(tmp_path):

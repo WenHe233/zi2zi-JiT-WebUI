@@ -36,6 +36,13 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    output = Path(args.output).resolve()
+    if args.project_dir:
+        fonts_root = (Path(args.project_dir).resolve() / "fonts").resolve()
+        if output.parent != fonts_root:
+            raise SystemExit(
+                f"--output must be directly inside the project fonts directory: {fonts_root}"
+            )
     glyphs = scan_glyph_directory(args.glyph_dir)
     if args.selection_manifest:
         selections = json.loads(Path(args.selection_manifest).read_text(encoding="utf-8"))
@@ -48,7 +55,7 @@ def main() -> None:
         )
     report = build_ttf(
         glyphs,
-        args.output,
+        output,
         FontMetadata(
             family_name=args.family,
             style_name=args.style,
@@ -76,7 +83,7 @@ def main() -> None:
         base_font_path=args.base_font or None,
     )
     archive = build_export_package(
-        args.output,
+        output,
         glyphs,
         project_dir=args.project_dir or None,
     )

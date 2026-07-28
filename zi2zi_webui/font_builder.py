@@ -13,6 +13,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from statistics import median
 from typing import Callable, TypeVar
+from uuid import uuid4
 
 import cv2
 import numpy as np
@@ -59,6 +60,25 @@ class CJKLayout:
     advance: int
     base_sample_count: int
     image_sample_count: int
+
+
+UNSAFE_FONT_NAME_RE = re.compile(r"[/\\\x00-\x1f\x7f]")
+STALE_DEVICE_TABLES = {"hdmx", "LTSH", "VDMX", "VORG"}
+
+
+def validate_font_metadata(metadata: FontMetadata) -> None:
+    values = {
+        "family name": metadata.family_name,
+        "style name": metadata.style_name,
+        "version": metadata.version,
+    }
+    if not metadata.family_name.strip():
+        raise ValueError("Font family name is required")
+    for label, value in values.items():
+        if UNSAFE_FONT_NAME_RE.search(value) or ".." in value:
+            raise ValueError(
+                f"Font {label} cannot contain path separators, control characters, or '..'"
+            )
 
 
 def codepoint_from_filename(path: str | Path) -> int | None:
@@ -329,6 +349,56 @@ def _cjk_layout(
     )
 
 
+def _vertical_layout(font: TTFont) -> tuple[int, int] | None:
+    if "vhea" not in font and "vmtx" not in font:
+        return None
+    if "vhea" not in font or "vmtx" not in font:
+        raise ValueError("Base font has incomplete vertical metrics tables")
+    cmap = font.getBestCmap() or {}
+    glyf = font["glyf"]
+    metrics = font["vmtx"].metrics
+    rows: list[tuple[int, int]] = []
+    for codepoint, glyph_name in cmap.items():
+        if not is_cjk_codepoint(codepoint) or glyph_name not in metrics:
+            continue
+        glyph = glyf[glyph_name]
+        if glyph.numberOfContours == 0:
+            continue
+        advance, top_side_bearing = metrics[glyph_name]
+        rows.append((advance, glyph.yMax + top_side_bearing))
+    if not rows:
+        for glyph_name in font.getGlyphOrder():
+            if glyph_name not in metrics:
+                continue
+            glyph = glyf[glyph_name]
+            if glyph.numberOfContours == 0:
+                continue
+            advance, top_side_bearing = metrics[glyph_name]
+            rows.append((advance, glyph.yMax + top_side_bearing))
+    if not rows:
+        raise ValueError("Base font vertical metrics do not cover any outlined glyphs")
+    return (
+        int(round(median(row[0] for row in rows))),
+        int(round(median(row[1] for row in rows))),
+    )
+
+
+def _validate_saved_font(path: Path, *, expect_vertical: bool) -> None:
+    checked = TTFont(path, checkChecksums=2, lazy=False)
+    try:
+        checked.getGlyphOrder()
+        checked.getBestCmap()
+        checked["glyf"].glyphs
+        checked["hmtx"].metrics
+        if expect_vertical:
+            checked["vhea"].numberOfVMetrics
+            checked["vmtx"].metrics
+            if len(checked["vmtx"].metrics) != len(checked.getGlyphOrder()):
+                raise ValueError("Vertical metrics count does not match glyph count")
+    finally:
+        checked.close()
+
+
 def _glyph_name(codepoint: int, used_names: set[str]) -> str:
     base = f"uni{codepoint:04X}" if codepoint <= 0xFFFF else f"u{codepoint:06X}"
     if base not in used_names:
@@ -433,14 +503,15 @@ def build_ttf(
     progress_callback: Callable[[int, int, int], None] | None = None,
     base_font_path: str | Path | None = None,
 ) -> dict:
-    if not metadata.family_name.strip():
-        raise ValueError("Font family name is required")
+    validate_font_metadata(metadata)
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     svg_dir = Path(svg_dir or output_path.with_suffix("")) / "svg"
     svg_dir.mkdir(parents=True, exist_ok=True)
 
     base_font = None
+    vertical_layout = None
+    vertical_metrics = None
     existing_outlines: set[int] = set()
     if base_font_path:
         candidate_font = TTFont(str(base_font_path))
@@ -460,6 +531,12 @@ def build_ttf(
             character_map = dict(candidate_font.getBestCmap() or {})
             glyph_order = list(candidate_font.getGlyphOrder())
             upm = int(candidate_font["head"].unitsPerEm)
+            vertical_layout = _vertical_layout(candidate_font)
+            vertical_metrics = (
+                candidate_font["vmtx"].metrics
+                if vertical_layout is not None
+                else None
+            )
         except Exception:
             candidate_font.close()
             raise
@@ -480,6 +557,13 @@ def build_ttf(
         for codepoint, image_path in sorted(glyph_images.items())
         if codepoint not in existing_outlines
     ]
+    if not ordered_images:
+        if base_font is not None:
+            base_font.close()
+        raise ValueError(
+            "No generated glyphs are missing from the base font; refusing to export "
+            "an unchanged renamed font"
+        )
     if len(glyph_order) + len(ordered_images) > 65535:
         if base_font is not None:
             base_font.close()
@@ -582,6 +666,12 @@ def build_ttf(
             glyph.recalcBounds(None)
             glyphs[glyph_name] = glyph
             metrics[glyph_name] = (advance, glyph.xMin)
+            if vertical_metrics is not None and vertical_layout is not None:
+                vertical_advance, vertical_origin = vertical_layout
+                vertical_metrics[glyph_name] = (
+                    vertical_advance,
+                    vertical_origin - glyph.yMax,
+                )
             character_map[codepoint] = glyph_name
             glyph_order.append(glyph_name)
             used_names.add(glyph_name)
@@ -597,6 +687,13 @@ def build_ttf(
             progress_callback(index, len(ordered_images), codepoint)
 
     attributed = len(report["included"]) > 200
+    if not report["included"]:
+        if base_font is not None:
+            base_font.close()
+        raise ValueError("No generated glyph could be vectorized; font was not created")
+    temporary_output = output_path.with_name(
+        f".{output_path.stem}-{uuid4().hex}.tmp{output_path.suffix}"
+    )
     if base_font is not None:
         base_font.setGlyphOrder(glyph_order)
         _update_cmap(base_font, additions)
@@ -606,9 +703,14 @@ def build_ttf(
             base_font["OS/2"].recalcUnicodeRanges(base_font)
         if "DSIG" in base_font:
             del base_font["DSIG"]
+        for table_name in STALE_DEVICE_TABLES:
+            if table_name in base_font:
+                del base_font[table_name]
+        if vertical_metrics is not None:
+            base_font["vhea"].numberOfVMetrics = len(glyph_order)
         _update_base_font_names(base_font, metadata, attributed=attributed)
         try:
-            base_font.save(output_path)
+            base_font.save(temporary_output)
         finally:
             base_font.close()
     else:
@@ -650,7 +752,17 @@ def build_ttf(
         font.setupPost()
         font.setupMaxp()
         font.setupHead()
-        font.save(output_path)
+        font.save(temporary_output)
+
+    try:
+        _validate_saved_font(
+            temporary_output,
+            expect_vertical=vertical_metrics is not None,
+        )
+        temporary_output.replace(output_path)
+    except Exception:
+        temporary_output.unlink(missing_ok=True)
+        raise
 
     report.update(
         {

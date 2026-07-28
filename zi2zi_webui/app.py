@@ -10,7 +10,12 @@ from urllib.parse import quote
 
 from .charts import latest_summary, run_parameter_rows, training_figures
 from .devices import detect_devices, disk_free_gb
-from .font_builder import codepoint_from_filename, scan_glyph_directory
+from .font_builder import (
+    FontMetadata,
+    codepoint_from_filename,
+    scan_glyph_directory,
+    validate_font_metadata,
+)
 from .i18n import translator
 from .inference import (
     build_inference_npz,
@@ -743,6 +748,16 @@ def build_app(
     ):
         project = storage.get_project(project_id)
         project_dir = storage.project_dir(project_id)
+        try:
+            validate_font_metadata(
+                FontMetadata(
+                    family_name=str(family or ""),
+                    style_name=str(style or ""),
+                    version=str(version or ""),
+                )
+            )
+        except ValueError as exc:
+            raise gr.Error(str(exc)) from exc
         selection = project_dir / "glyphs" / "selection.json"
         if not str(glyph_dir or "").strip():
             raise gr.Error("Choose a generated glyph directory")
@@ -790,7 +805,10 @@ def build_app(
         job_ids = []
         for profile in profiles or ["proportional"]:
             suffix = "Text" if profile == "proportional" else "Mono"
-            output = project_dir / "fonts" / f"{family}-{suffix}-{version}.ttf"
+            fonts_root = (project_dir / "fonts").resolve()
+            output = (fonts_root / f"{family}-{suffix}-{version}.ttf").resolve()
+            if output.parent != fonts_root:
+                raise gr.Error("Font output path escaped the project fonts directory")
             command = [
                 sys.executable,
                 str(ROOT / "scripts" / "build_font.py"),
