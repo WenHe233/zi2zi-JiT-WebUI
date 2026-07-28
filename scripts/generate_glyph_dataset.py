@@ -8,7 +8,7 @@ glyphs are still rendered from a source font.
 Glyph folder layout:  {character}.png  (e.g., 万.png, 鶴.png)
 Each image should be 256x256 RGB.
 
-The user specifies --train-count; remaining glyphs go to test.
+The user specifies exact --train-count and --test-count values.
 References for both train and test are drawn from the train set.
 
 Output layout (same as generate_font_dataset.py):
@@ -21,6 +21,7 @@ Usage:
         --glyph-dir data/sample_glyphs \
         --output-dir data/glyph_dataset \
         --train-count 200 \
+        --test-count 20 \
         --font-name my_custom_font
 
     # Train only
@@ -43,7 +44,7 @@ logger = logging.getLogger(__name__)
 
 from PIL import Image
 
-from data_processing.font_utils import GlyphRendererPool
+from data_processing.font_utils import GlyphRendererPool, scan_rendered_glyphs
 from data_processing.pipeline import (
     create_combined_image,
     _format_codepoint,
@@ -70,7 +71,9 @@ def get_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", required=True,
                         help="Root output directory. Creates train/ and test/ subdirectories.")
     parser.add_argument("--train-count", required=True, type=int,
-                        help="Number of glyphs for training. Remaining go to test.")
+                        help="Exact number of training glyphs.")
+    parser.add_argument("--test-count", default=1, type=int,
+                        help="Exact number of held-out validation glyphs.")
     parser.add_argument("--font-name", type=str, default=None,
                         help="Font name for output folder (default: glyph-dir folder name).")
     parser.add_argument("--font-index", type=int, default=1, help="Font index for folder naming (default: 1).")
@@ -91,17 +94,7 @@ def get_args() -> argparse.Namespace:
 
 def load_glyphs(glyph_dir: Path) -> list:
     """Load glyph images from folder. Returns sorted list of (codepoint, path)."""
-    glyphs = []
-    for f in glyph_dir.iterdir():
-        if not f.is_file() or f.suffix.lower() not in ('.png', '.jpg', '.jpeg'):
-            continue
-        char = f.stem
-        if len(char) != 1:
-            continue
-        codepoint = ord(char)
-        glyphs.append((codepoint, f))
-    glyphs.sort(key=lambda x: x[0])
-    return glyphs
+    return sorted(scan_rendered_glyphs(glyph_dir).items())
 
 
 def create_ref_grid_from_images(
@@ -131,6 +124,8 @@ def generate_split(
     source_font_paths: list[Path],
     resolution: int,
     seed: int,
+    progress_offset: int = 0,
+    progress_total: int = 1,
 ) -> dict:
     """Generate train or test split."""
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -169,6 +164,21 @@ def generate_split(
             "reference_codepoints_2": [_format_codepoint(r) for r in refs[4:]],
         })
         successful += 1
+        current = progress_offset + local_index + 1
+        print(
+            "WEBUI_PROGRESS "
+            + json.dumps(
+                {
+                    "current": current,
+                    "total": progress_total,
+                    "message": (
+                        f"Generating {split_name} glyph "
+                        f"{local_index + 1}/{len(codepoints)}"
+                    ),
+                }
+            ),
+            flush=True,
+        )
     logger.info("  %s: %d extracted, %d failed", split_name, successful, failed)
 
     metadata = {
@@ -209,28 +219,36 @@ def main() -> None:
     all_codepoints = [cp for cp, _ in glyphs]
     total = len(all_codepoints)
 
-    if args.train_count >= total:
-        print(f"Error: --train-count ({args.train_count}) >= total glyphs ({total}). "
-              f"Need at least 1 for test.")
-        if not args.train_only:
-            return
-        args.train_count = total
-
     if args.train_count < 9:
-        print(f"Error: --train-count ({args.train_count}) must be >= 9 for references.")
-        return
+        raise ValueError(
+            f"--train-count ({args.train_count}) must be >= 9 for references"
+        )
+    if args.test_count < 1 and not args.train_only:
+        raise ValueError("--test-count must be >= 1")
+
+    source_renderer = GlyphRendererPool(source_font_paths, args.resolution)
+    usable_codepoints = [
+        codepoint
+        for codepoint in all_codepoints
+        if source_renderer.source_for(codepoint) is not None
+    ]
+    required = args.train_count + (0 if args.train_only else args.test_count)
+    if required > len(usable_codepoints):
+        raise ValueError(
+            f"Requested {required} train/validation glyphs, but only "
+            f"{len(usable_codepoints)} have valid target images and source outlines"
+        )
 
     # Shuffle and split
     rng = random.Random(args.seed)
-    shuffled = list(all_codepoints)
+    shuffled = list(usable_codepoints)
     rng.shuffle(shuffled)
     train_cps = sorted(shuffled[:args.train_count])
-    test_cps = sorted(shuffled[args.train_count:])
+    test_cps = sorted(
+        shuffled[args.train_count : args.train_count + args.test_count]
+    )
 
     print(f"Glyphs: {total} total, {len(train_cps)} train, {len(test_cps)} test")
-
-    # Source renderer
-    source_renderer = GlyphRendererPool(source_font_paths, args.resolution)
 
     # Generate train
     train_out = output_dir / "train" / folder_name
@@ -238,8 +256,15 @@ def main() -> None:
     train_result = generate_split(
         "train", train_cps, train_cps, glyph_map, source_renderer,
         train_out, font_name, font_index, source_font_paths, args.resolution, args.seed,
+        progress_offset=0,
+        progress_total=required,
     )
     print(f"  extracted={train_result['extracted']} failed={train_result['failed']}")
+    if train_result["extracted"] != args.train_count:
+        raise RuntimeError(
+            f"Training split produced {train_result['extracted']} of "
+            f"{args.train_count} requested glyphs"
+        )
 
     # Generate test
     if not args.train_only:
@@ -248,8 +273,15 @@ def main() -> None:
         test_result = generate_split(
             "test", test_cps, train_cps, glyph_map, source_renderer,
             test_out, font_name, font_index, source_font_paths, args.resolution, args.seed,
+            progress_offset=args.train_count,
+            progress_total=required,
         )
         print(f"  extracted={test_result['extracted']} failed={test_result['failed']}")
+        if test_result["extracted"] != args.test_count:
+            raise RuntimeError(
+                f"Validation split produced {test_result['extracted']} of "
+                f"{args.test_count} requested glyphs"
+            )
 
         # Convert test set to NPZ
         test_dir = output_dir / "test"
@@ -257,6 +289,11 @@ def main() -> None:
         print(f"\n=== Creating test NPZ -> {npz_path} ===")
         result = create_test_npz(test_dir, npz_path)
         print(f"  {result['samples']} samples ({result['file_size_mb']:.1f} MB)")
+        if result["samples"] != args.test_count or not npz_path.is_file():
+            raise RuntimeError(
+                f"Validation NPZ contains {result['samples']} of "
+                f"{args.test_count} requested glyphs"
+            )
 
     print("\nDone!")
 

@@ -209,15 +209,16 @@ def build_app(
                 storage.project_dir(project_id) / "inputs" / "style-references",
             )
         else:
+            from data_processing.font_utils import scan_rendered_glyphs
+
             candidates = []
             for asset in project.target_assets:
                 path = Path(asset)
                 if path.is_dir():
-                    candidates.extend(
-                        item
-                        for item in path.iterdir()
-                        if item.suffix.lower() in {".png", ".jpg", ".jpeg"}
-                    )
+                    try:
+                        candidates.extend(scan_rendered_glyphs(path).values())
+                    except ValueError as exc:
+                        raise gr.Error(str(exc)) from exc
                 elif path.suffix.lower() in {".png", ".jpg", ".jpeg"}:
                     candidates.append(path)
             project.style_reference_pool = choose_diverse_references(candidates, 8)

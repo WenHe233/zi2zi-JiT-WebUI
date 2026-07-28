@@ -1,6 +1,8 @@
 import pytest
+from PIL import Image, ImageDraw
 
 from zi2zi_webui.services import (
+    font_dataset_capacity,
     dataset_max_chars_per_font,
     dataset_command,
     dataset_size_preset,
@@ -10,6 +12,7 @@ from zi2zi_webui.services import (
     resolve_generation_checkpoint,
     resolve_training_dataset,
 )
+from zi2zi_webui.font_builder import FontMetadata, build_ttf
 from zi2zi_webui.models import TrainingRun
 from zi2zi_webui.storage import Storage
 from util.training_schedule import periodic_or_final
@@ -61,6 +64,55 @@ def test_auto_dataset_uses_ordered_global_fonts_without_a_region_filter(tmp_path
     assert command[start : start + 2] == ["jigmo-1.ttf", "jigmo-2.ttf"]
     assert command[command.index("--charset") + 1] == "auto"
     assert "dataset-auto-train3000-test64" in str(output)
+
+
+def test_rendered_glyph_dataset_passes_exact_validation_count(tmp_path):
+    storage = Storage(tmp_path / "state")
+    project = storage.create_project("Rendered")
+    project.input_mode = "glyphs"
+    project.global_source_fonts = ["source.ttf"]
+    project.target_assets = ["glyphs"]
+
+    command, _output = dataset_command(
+        project,
+        storage,
+        train_count=9,
+        test_count=3,
+        charset="auto",
+        workers=1,
+    )
+
+    assert command[command.index("--train-count") + 1] == "9"
+    assert command[command.index("--test-count") + 1] == "3"
+
+
+def test_rendered_glyph_capacity_requires_valid_target_and_source_outlines(tmp_path):
+    def draw_glyph(path):
+        image = Image.new("L", (256, 256), "white")
+        draw = ImageDraw.Draw(image)
+        draw.rectangle((40, 40, 210, 210), fill="black")
+        image.save(path)
+
+    shape = tmp_path / "shape.png"
+    draw_glyph(shape)
+    source_font = tmp_path / "source.ttf"
+    build_ttf(
+        {0x4E00: shape},
+        source_font,
+        FontMetadata(family_name="Source"),
+    )
+    glyph_dir = tmp_path / "glyphs"
+    glyph_dir.mkdir()
+    draw_glyph(glyph_dir / "U+4E00.png")
+    draw_glyph(glyph_dir / "U+4E01.png")
+
+    storage = Storage(tmp_path / "state")
+    project = storage.create_project("Capacity")
+    project.input_mode = "glyphs"
+    project.global_source_fonts = [str(source_font)]
+    project.target_assets = [str(glyph_dir)]
+
+    assert font_dataset_capacity(project, "auto") == 1
 
 
 def test_checkpoint_variant_is_inferred_from_official_filename():

@@ -5,7 +5,14 @@ from PIL import Image, ImageDraw
 from fontTools.pens.ttGlyphPen import TTGlyphPen
 from fontTools.ttLib import TTFont
 
-from data_processing.font_utils import GlyphRendererPool, get_preserved_codepoints
+import pytest
+
+from data_processing.font_utils import (
+    GlyphRendererPool,
+    codepoint_from_glyph_filename,
+    get_preserved_codepoints,
+    scan_rendered_glyphs,
+)
 from zi2zi_webui.font_builder import (
     ATTRIBUTION,
     FontMetadata,
@@ -34,6 +41,38 @@ def test_filename_codepoint_parser():
     assert codepoint_from_filename("0000_U+4E00_c00_s42.png") == 0x4E00
     assert codepoint_from_filename("uni0041.png") == 0x41
     assert codepoint_from_filename("not-a-glyph.png") is None
+
+
+@pytest.mark.parametrize(
+    ("filename", "expected"),
+    [
+        ("万.png", 0x4E07),
+        ("U+4E00.png", 0x4E00),
+        ("uni4E01.png", 0x4E01),
+        ("u20000.png", 0x20000),
+        ("0000_U+3400_c00_s42.png", 0x3400),
+    ],
+)
+def test_rendered_glyph_filename_parser(filename, expected):
+    assert codepoint_from_glyph_filename(filename) == expected
+
+
+def test_rendered_glyph_scanner_rejects_duplicates_and_empty_images(tmp_path):
+    _glyph(tmp_path / "U+4E00.png")
+    _glyph(tmp_path / "uni4E00.png")
+    with pytest.raises(ValueError, match="Duplicate.*U\\+4E00"):
+        scan_rendered_glyphs(tmp_path)
+
+    (tmp_path / "uni4E00.png").unlink()
+    Image.new("L", (256, 256), "white").save(tmp_path / "U+4E01.png")
+    with pytest.raises(ValueError, match="empty.*U\\+4E01"):
+        scan_rendered_glyphs(tmp_path)
+
+
+def test_rendered_glyph_scanner_rejects_unparseable_names(tmp_path):
+    _glyph(tmp_path / "glyph-without-codepoint.png")
+    with pytest.raises(ValueError, match="filenames must contain"):
+        scan_rendered_glyphs(tmp_path)
 
 
 def test_scan_glyph_directory_finds_nested_generator_outputs(tmp_path):
@@ -342,6 +381,31 @@ def test_source_font_pool_uses_ordered_coverage_fallback(tmp_path):
     assert pool.source_for(0x4E01) == first.resolve()
     assert pool.source_for(0x4E02) == second.resolve()
     assert pool.render(0x4E02) is not None
+
+
+def test_source_font_pool_rejects_cmap_entries_without_outlines(tmp_path):
+    source = tmp_path / "shape.png"
+    _glyph(source)
+    font_path = tmp_path / "EmptyCmap.ttf"
+    build_ttf(
+        {0x4E00: source},
+        font_path,
+        FontMetadata(family_name="Empty cmap"),
+    )
+    font = TTFont(font_path)
+    empty_name = "emptyGlyph"
+    font["glyf"].glyphs[empty_name] = TTGlyphPen(None).glyph()
+    font["hmtx"].metrics[empty_name] = (1000, 0)
+    font.setGlyphOrder([*font.getGlyphOrder(), empty_name])
+    for table in font["cmap"].tables:
+        if table.isUnicode() and hasattr(table, "cmap") and table.format != 14:
+            table.cmap[0x4E01] = empty_name
+    font.save(font_path)
+    font.close()
+
+    pool = GlyphRendererPool([font_path], 256)
+    assert pool.source_for(0x4E01) is None
+    assert pool.render(0x4E01) is None
 
 
 def test_attribution_over_200_glyphs(tmp_path, monkeypatch):

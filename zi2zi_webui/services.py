@@ -41,7 +41,26 @@ def dataset_size_preset(name: str) -> tuple[int, int]:
 
 def font_dataset_capacity(manifest: ProjectManifest, charset: str) -> int:
     if manifest.input_mode != "font":
-        return len(manifest.target_assets)
+        if not manifest.target_assets:
+            raise ValueError("A rendered glyph directory is required")
+        from data_processing.font_utils import GlyphRendererPool, scan_rendered_glyphs
+
+        source_fonts = manifest.source_fonts_for_region(
+            {
+                "gb2312": "SC",
+                "gbk": "SC",
+                "big5": "TC",
+                "jisx0208": "JP",
+                "ksx1001": "KR",
+            }.get(charset)
+        )
+        if not source_fonts:
+            raise ValueError("At least one source font is required")
+        glyphs = scan_rendered_glyphs(manifest.target_assets[0])
+        source_pool = GlyphRendererPool(source_fonts, 256)
+        return sum(
+            1 for codepoint in glyphs if source_pool.source_for(codepoint) is not None
+        )
     source_fonts = manifest.source_fonts_for_region(
         {
             "gb2312": "SC",
@@ -302,6 +321,8 @@ def dataset_command(
             str(output),
             "--train-count",
             str(train_count),
+            "--test-count",
+            str(test_count),
         ]
     return command, output
 

@@ -1,4 +1,5 @@
 from pathlib import Path
+import re
 from typing import Iterable, Optional, Set, Tuple
 
 from fontTools.ttLib import TTFont
@@ -6,6 +7,7 @@ from PIL import Image, ImageDraw, ImageFont
 
 
 SUPPORTED_FONT_SUFFIXES = {".ttf", ".otf", ".TTF", ".OTF"}
+GLYPH_IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg"}
 
 CJK_RANGES = [
     (0x4E00, 0x9FFF),    # CJK Unified Ideographs
@@ -51,6 +53,70 @@ def is_cjk_codepoint(codepoint: int) -> bool:
         if start <= codepoint <= end:
             return True
     return False
+
+
+def codepoint_from_glyph_filename(path: str | Path) -> int | None:
+    """Resolve literal-character and conventional Unicode glyph filenames."""
+    stem = Path(path).stem
+    if len(stem) == 1:
+        return ord(stem)
+    match = re.search(r"(?:U\+|uni|u)([0-9A-Fa-f]{4,6})", stem)
+    if not match:
+        return None
+    codepoint = int(match.group(1), 16)
+    if codepoint > 0x10FFFF or 0xD800 <= codepoint <= 0xDFFF:
+        return None
+    return codepoint
+
+
+def scan_rendered_glyphs(path: str | Path) -> dict[int, Path]:
+    """Return validated rendered glyph images keyed by Unicode codepoint."""
+    root = Path(path)
+    if not root.is_dir():
+        raise ValueError(f"Rendered glyph directory does not exist: {root}")
+    glyphs: dict[int, Path] = {}
+    duplicates: dict[int, list[Path]] = {}
+    invalid_names: list[Path] = []
+    invalid_images: list[Path] = []
+    for image_path in sorted(root.rglob("*")):
+        if not image_path.is_file() or image_path.suffix.lower() not in GLYPH_IMAGE_SUFFIXES:
+            continue
+        codepoint = codepoint_from_glyph_filename(image_path)
+        if codepoint is None:
+            invalid_names.append(image_path)
+            continue
+        try:
+            with Image.open(image_path) as image:
+                image.load()
+                extrema = image.convert("L").getextrema()
+        except (OSError, ValueError):
+            invalid_images.append(image_path)
+            continue
+        if not extrema or extrema[0] == extrema[1]:
+            invalid_images.append(image_path)
+            continue
+        if codepoint in glyphs:
+            duplicates.setdefault(codepoint, [glyphs[codepoint]]).append(image_path)
+            continue
+        glyphs[codepoint] = image_path
+    if duplicates:
+        details = "; ".join(
+            f"U+{codepoint:04X}: {', '.join(item.name for item in paths)}"
+            for codepoint, paths in sorted(duplicates.items())
+        )
+        raise ValueError(f"Duplicate rendered glyph codepoints: {details}")
+    if invalid_names:
+        examples = ", ".join(item.name for item in invalid_names[:5])
+        raise ValueError(
+            "Rendered glyph filenames must contain a literal character, U+XXXX, "
+            f"uniXXXX, or uXXXXX codepoint; invalid: {examples}"
+        )
+    if invalid_images:
+        examples = ", ".join(item.name for item in invalid_images[:5])
+        raise ValueError(f"Unreadable or empty rendered glyph images: {examples}")
+    if not glyphs:
+        raise ValueError(f"No valid rendered glyph images were found under: {root}")
+    return glyphs
 
 
 def has_valid_outline(font: TTFont, codepoint: int) -> bool:
@@ -262,8 +328,10 @@ class GlyphRendererPool:
                 for index in candidates
                 if has_valid_outline(self.renderers[index]._tt_font, codepoint)
             ),
-            candidates[0],
+            None,
         )
+        if owner is None:
+            return None
         self._owners[codepoint] = owner
         return owner
 
